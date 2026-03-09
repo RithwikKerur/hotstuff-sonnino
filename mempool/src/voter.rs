@@ -100,14 +100,15 @@ impl SelfVoter {
     async fn run(&mut self) {
         while let Some((shard, serialized_shard)) = self.rx_authenticated_shard.recv().await {
             // Verify the shard.
-            if let Err(e) = shard.verify(&self.name, &self.committee) {
+            if let Err(e) = shard.verify(&self.committee) {
                 warn!("{}", e);
                 continue;
             }
 
-            // Store the shard.
+            // Store the shard, keyed by root||shard_index so multiple shards
+            // for the same batch don't overwrite each other.
             let mut key = shard.root.to_vec();
-            key.extend(self.name.to_vec());
+            key.extend_from_slice(&shard.destination.to_le_bytes());
             self.store.write(key, serialized_shard).await;
 
             // Reply with a signature.
@@ -168,14 +169,15 @@ impl NodesVoter {
                 // Process incoming coded shards.
                 Some((shard, serialized_shard)) = self.rx_authenticated_shard.recv() => {
                     // Verify the shard.
-                    if let Err(e) = shard.verify(&self.name, &self.committee) {
+                    if let Err(e) = shard.verify(&self.committee) {
                         warn!("{}", e);
                         continue;
                     }
 
-                    // Store the shard.
+                    // Store the shard, keyed by root||shard_index so multiple shards
+                    // for the same batch don't overwrite each other.
                     let mut key = shard.root.to_vec();
-                    key.extend(self.name.to_vec());
+                    key.extend_from_slice(&shard.destination.to_le_bytes());
                     self.store.write(key, serialized_shard).await;
 
                     // Reply with a signature.

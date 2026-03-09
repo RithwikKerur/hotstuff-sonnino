@@ -70,14 +70,13 @@ impl Reconstructor {
                     //debug!("Received shard of {}", shard.root);
 
                     // Verify the shard.
-                    let destination = match self.committee.name(shard.destination) {
-                        Some(x) => x,
-                        None => {
-                            warn!("Invalid shard: Unknown destination node");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = shard.verify(&destination, &self.committee) {
+                    let (data_shards, parity_shards) = self.committee.shards();
+                    let total_shards = data_shards + parity_shards;
+                    if shard.destination >= total_shards {
+                        warn!("Invalid shard: destination index out of range");
+                        continue;
+                    }
+                    if let Err(e) = shard.verify(&self.committee) {
                         warn!("{}", e);
                         continue;
                     }
@@ -90,13 +89,12 @@ impl Reconstructor {
                     }
 
                     // Add the shard to the aggregator.
-                    let size = self.committee.size();
                     let index = shard.destination;
                     let root = shard.root.clone();
                     self
                         .collected_shards
                         .entry(root.clone())
-                        .or_insert_with(|| vec![None; size])[index] = Some(shard.shard);
+                        .or_insert_with(|| vec![None; total_shards])[index] = Some(shard.shard);
 
                     // Check if we have enough shards to reconstruct the batch.
                     let (data_shards, _) = self.committee.shards();

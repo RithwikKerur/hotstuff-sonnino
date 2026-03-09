@@ -184,7 +184,7 @@ impl AuthenticatedShard {
     }
 
     /// Verify the authenticated shard.
-    pub fn verify(&self, name: &PublicKey, committee: &Committee) -> MempoolResult<()> {
+    pub fn verify(&self, committee: &Committee) -> MempoolResult<()> {
         // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
@@ -200,14 +200,11 @@ impl AuthenticatedShard {
         // Verify the signature on the Merkle root.
         self.signature.verify(&self.root, &self.author)?;
 
-        // Build the leaf of the Merkle Tree.
-        let index = committee
-            .index(name)
-            .expect("Our public key is not in the committee");
-
+        // Build the leaf of the Merkle Tree using the absolute shard index,
+        // matching the index used in CodedBatch::commit().
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.shard);
-        hasher.update(&index.to_le_bytes());
+        hasher.update(&self.destination.to_le_bytes());
         let hash = hasher.finalize();
         let leaf = MTreeNodeSmt::new(hash.as_bytes().to_vec());
 
