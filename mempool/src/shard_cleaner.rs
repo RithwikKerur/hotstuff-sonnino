@@ -1,6 +1,6 @@
 use crate::{aggregator::FullAvailabilityProof, config::Committee};
 use crypto::PublicKey;
-use log::warn;
+use log::{debug, info, warn};
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -34,8 +34,10 @@ impl ShardCleaner {
 
     async fn run(&mut self) {
         while let Some(proof) = self.rx_proof.recv().await {
+            debug!("Received full availability proof for batch {}", proof.root);
+
             if let Err(e) = proof.verify(&self.committee) {
-                warn!("Invalid full availability proof: {}", e);
+                warn!("Invalid full availability proof for batch {}: {}", proof.root, e);
                 continue;
             }
 
@@ -46,12 +48,19 @@ impl ShardCleaner {
             };
 
             // Keep the first shard (offset 0) and delete offsets 1..data_shards-1.
+            let kept = node_idx * data_shards;
+            let deleted_count = data_shards - 1;
             for offset in 1..data_shards {
                 let shard_idx = node_idx * data_shards + offset;
                 let mut key = proof.root.to_vec();
                 key.extend_from_slice(&shard_idx.to_le_bytes());
+                debug!("Dropping shard {} of batch {}", shard_idx, proof.root);
                 self.store.delete(key).await;
             }
+            info!(
+                "Pruned batch {}: kept shard {}, dropped {} shards",
+                proof.root, kept, deleted_count
+            );
         }
     }
 }

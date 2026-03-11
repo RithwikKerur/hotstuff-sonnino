@@ -7,7 +7,7 @@ use crate::{
 };
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, Signature};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use network::SimpleSender;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -164,6 +164,7 @@ impl AggregatorService {
             loop {
                 tokio::select! {
                     Some(root) = rx_root.recv() => {
+                        debug!("Tracking votes for new batch {}", root);
                         aggregators.insert(root, Aggregator::new(name));
                     },
                     Some(vote) = rx_vote.recv() => {
@@ -171,16 +172,20 @@ impl AggregatorService {
                             warn!("{}", e);
                             continue;
                         }
+                        debug!("Received vote for batch {} from {}", vote.root, vote.author);
                         let aggregator = match aggregators.get_mut(&vote.root) {
                             Some(x) => x,
-                            None => continue,
+                            None => {
+                                debug!("Ignoring vote for unknown/completed batch {}", vote.root);
+                                continue;
+                            }
                         };
 
                         match aggregator.append(vote.root, vote.signature, vote.author, &committee) {
                             Ok((cert_opt, proof_opt)) => {
                                 if let Some(certificate) = cert_opt {
                                     let root = certificate.root.clone();
-                                    debug!("Assembled certificate for batch {}", root);
+                                    info!("Assembled BatchCertificate for batch {} ({} votes)", root, certificate.votes.len());
 
                                     tx_output
                                         .send(certificate.clone())
@@ -201,7 +206,7 @@ impl AggregatorService {
                                 if let Some(proof) = proof_opt {
                                     let root = proof.root.clone();
                                     let _ = aggregators.remove(&root);
-                                    debug!("Assembled full availability proof for batch {}", root);
+                                    info!("Assembled FullAvailabilityProof for batch {} (all {} nodes responded) — broadcasting shard pruning signal", root, committee.size());
 
                                     // Broadcast to all other nodes.
                                     let addresses = committee

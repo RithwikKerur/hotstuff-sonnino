@@ -7,7 +7,7 @@ use crate::{
 };
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, Signature, SignatureService};
-use log::warn;
+use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -105,6 +105,8 @@ impl SelfVoter {
                 continue;
             }
 
+            debug!("SelfVoter: storing shard {} for batch {}", shard.destination, shard.root);
+
             // Store the shard, keyed by root||shard_index so multiple shards
             // for the same batch don't overwrite each other.
             let mut key = shard.root.to_vec();
@@ -112,6 +114,7 @@ impl SelfVoter {
             self.store.write(key, serialized_shard).await;
 
             // Reply with a signature.
+            debug!("SelfVoter: voting for batch {}", shard.root);
             let vote = BatchVote::new(shard.root, self.name, &mut self.signature_service).await;
             self.tx_vote.send(vote).await.expect("Failed to send vote");
         }
@@ -174,6 +177,8 @@ impl NodesVoter {
                         continue;
                     }
 
+                    debug!("NodesVoter: storing shard {} for batch {}", shard.destination, shard.root);
+
                     // Store the shard, keyed by root||shard_index so multiple shards
                     // for the same batch don't overwrite each other.
                     let mut key = shard.root.to_vec();
@@ -182,6 +187,7 @@ impl NodesVoter {
 
                     // Reply with a signature.
                     let root = shard.root;
+                    debug!("NodesVoter: sending vote for batch {} to {}", root, shard.author);
                     let vote = BatchVote::new(root.clone(), self.name, &mut self.signature_service).await;
 
                     // Reply with a vote message.
