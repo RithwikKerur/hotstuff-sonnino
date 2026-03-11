@@ -1,11 +1,12 @@
 use crate::{
-    aggregator::{AggregatorService, BatchCertificate},
+    aggregator::{AggregatorService, BatchCertificate, FullAvailabilityProof},
     batch_maker::{BatchMaker, Transaction},
     certificate_verifier::CertificateVerifier,
     coded_batch::{AuthenticatedShard, CodedBatch},
     config::{Committee, Parameters},
     helper::Helper,
     reconstructor::{Reconstructor, SerializedCodedBatch},
+    shard_cleaner::ShardCleaner,
     synchronizer::Synchronizer,
     voter::{BatchVote, NodesVoter, SelfVoter, SerializedShard},
 };
@@ -37,6 +38,7 @@ pub enum MempoolMessage {
     ShardReply(AuthenticatedShard),
     BatchRequest(Digest, PublicKey),
     CodedBatch(CodedBatch),
+    FullAvailabilityProof(FullAvailabilityProof),
 }
 
 pub struct Mempool;
@@ -63,6 +65,8 @@ impl Mempool {
 
         let (tx_aggregator, rx_aggregator) = channel(CHANNEL_CAPACITY);
         let (tx_missing, rx_missing) = channel(CHANNEL_CAPACITY);
+        // Shared proof channel: fed by AggregatorService (self) and network (other leaders).
+        let (tx_proof, rx_proof) = channel(CHANNEL_CAPACITY);
 
         // Spawn all mempool tasks.
         Self::handle_consensus_messages(
@@ -82,6 +86,7 @@ impl Mempool {
             tx_consensus.clone(),
             tx_aggregator.clone(),
             rx_aggregator,
+            tx_proof.clone(),
         );
         Self::handle_mempool_messages(
             name,
@@ -91,6 +96,8 @@ impl Mempool {
             tx_consensus,
             tx_aggregator,
             rx_missing,
+            tx_proof,
+            rx_proof,
         );
 
         info!(
@@ -134,6 +141,7 @@ impl Mempool {
         tx_consensus: Sender<BatchCertificate>,
         tx_aggregator: Sender<BatchVote>,
         rx_aggregator: Receiver<BatchVote>,
+        tx_proof: Sender<FullAvailabilityProof>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
@@ -175,6 +183,7 @@ impl Mempool {
             rx_root,
             /* rx_vote */ rx_aggregator,
             /* tx_output */ tx_consensus,
+            /* tx_self_proof */ tx_proof,
         );
 
         info!("Mempool listening to client transactions on {}", address);
@@ -189,6 +198,8 @@ impl Mempool {
         tx_consensus: Sender<BatchCertificate>,
         tx_aggregator: Sender<BatchVote>,
         rx_missing: Receiver<Digest>,
+        tx_proof: Sender<FullAvailabilityProof>,
+        rx_proof: Receiver<FullAvailabilityProof>,
     ) {
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
         let (tx_certificate_verifier, rx_certificate_verifier) = channel(CHANNEL_CAPACITY);
@@ -211,6 +222,7 @@ impl Mempool {
                 tx_helper,
                 tx_shard,
                 tx_batch,
+                tx_proof,
             },
         );
 
@@ -237,7 +249,9 @@ impl Mempool {
             /* rx_request */ rx_helper,
         );
 
-        Reconstructor::spawn(committee, store, rx_missing, rx_shard, rx_batch);
+        Reconstructor::spawn(committee.clone(), store.clone(), rx_missing, rx_shard, rx_batch);
+
+        ShardCleaner::spawn(name, committee, store, rx_proof);
 
         info!("Mempool listening to mempool messages on {}", address);
     }
@@ -273,6 +287,7 @@ struct MempoolReceiverHandler {
     tx_helper: Sender<(Digest, PublicKey, bool)>,
     tx_shard: Sender<AuthenticatedShard>,
     tx_batch: Sender<(CodedBatch, SerializedCodedBatch)>,
+    tx_proof: Sender<FullAvailabilityProof>,
 }
 
 #[async_trait]
@@ -323,6 +338,11 @@ impl MessageHandler for MempoolReceiverHandler {
                 .send((batch, serialized.to_vec()))
                 .await
                 .expect("Failed to send batch"),
+            Ok(MempoolMessage::FullAvailabilityProof(proof)) => self
+                .tx_proof
+                .send(proof)
+                .await
+                .expect("Failed to send full availability proof"),
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())

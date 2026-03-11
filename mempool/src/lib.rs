@@ -7,6 +7,7 @@ mod error;
 mod helper;
 mod mempool;
 mod reconstructor;
+mod shard_cleaner;
 mod synchronizer;
 mod voter;
 
