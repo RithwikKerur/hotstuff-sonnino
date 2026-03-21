@@ -133,7 +133,7 @@ impl BatchMaker {
         // Increase the batch count.
         self.batch_counter += 1;
 
-        // Encode the payload using RS erasure codes. We can recover with f+1 shards.
+        // Encode the payload using RS erasure codes. We can recover with 2f+1 shards.
         let batch: Vec<_> = self.current_batch.drain(..).collect();
         let coded_batch = CodedBatch::new(batch, self.current_batch_size, &self.committee);
         self.current_batch_size = 0;
