@@ -1,0 +1,11 @@
+[package]
+name = "db-inspector"
+version = "0.1.0"
+edition = "2018"
+
+[[bin]]
+name = "db_sizes"
+path = "src/main.rs"
+
+[dependencies]
+rocksdb = "0.15.0"
