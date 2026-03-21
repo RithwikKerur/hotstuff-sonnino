@@ -28,6 +28,10 @@ fn main() {
         std::process::exit(1);
     }
 
+    // MempoolMessage::CodedBatch is variant index 6.
+    // bincode encodes enum variants as a little-endian u32.
+    const CODED_BATCH_TAG: &[u8] = &[6, 0, 0, 0];
+
     let mut grand_keys: u64 = 0;
     let mut grand_bytes: u64 = 0;
 
@@ -40,28 +44,35 @@ fn main() {
         let mut bytes: u64 = 0;
 
         for (k, v) in db.iterator(rocksdb::IteratorMode::Start) {
+            if !v.starts_with(CODED_BATCH_TAG) {
+                continue;
+            }
             keys += 1;
             bytes += k.len() as u64 + v.len() as u64;
         }
 
+        let avg = if keys > 0 { bytes / keys } else { 0 };
         println!(
-            "{:<12}  {:>8} entries  {:>12} bytes  ({:.2} KB)",
+            "{:<12}  {:>8} CodedBatches  {:>12} bytes  ({:.2} KB)  avg {:>6} B/entry",
             name,
             keys,
             bytes,
-            bytes as f64 / 1024.0
+            bytes as f64 / 1024.0,
+            avg,
         );
         grand_keys += keys;
         grand_bytes += bytes;
     }
 
-    println!("{}", "-".repeat(60));
+    let grand_avg = if grand_keys > 0 { grand_bytes / grand_keys } else { 0 };
+    println!("{}", "-".repeat(72));
     println!(
-        "{:<12}  {:>8} entries  {:>12} bytes  ({:.2} KB)  across {} DBs",
+        "{:<12}  {:>8} CodedBatches  {:>12} bytes  ({:.2} KB)  avg {:>6} B/entry  across {} DBs",
         "TOTAL",
         grand_keys,
         grand_bytes,
         grand_bytes as f64 / 1024.0,
+        grand_avg,
         db_dirs.len()
     );
 }
