@@ -98,17 +98,18 @@ impl SelfVoter {
     }
 
     async fn run(&mut self) {
-        while let Some((shard, serialized_shard)) = self.rx_authenticated_shard.recv().await {
+        while let Some((shard, _serialized_shard)) = self.rx_authenticated_shard.recv().await {
             // Verify the shard.
             if let Err(e) = shard.verify(&self.name, &self.committee) {
                 warn!("{}", e);
                 continue;
             }
 
-            // Store the shard.
+            // Store only the raw shard bytes — proof and signature already verified.
             let mut key = shard.root.to_vec();
             key.extend(self.name.to_vec());
-            self.store.write(key, serialized_shard).await;
+            log::info!("SelfVoter storing shard: {} bytes", shard.shard.len());
+            self.store.write(key, shard.shard.clone()).await;
 
             // Reply with a signature.
             let vote = BatchVote::new(shard.root, self.name, &mut self.signature_service).await;
@@ -166,17 +167,18 @@ impl NodesVoter {
         loop {
             tokio::select! {
                 // Process incoming coded shards.
-                Some((shard, serialized_shard)) = self.rx_authenticated_shard.recv() => {
+                Some((shard, _serialized_shard)) = self.rx_authenticated_shard.recv() => {
                     // Verify the shard.
                     if let Err(e) = shard.verify(&self.name, &self.committee) {
                         warn!("{}", e);
                         continue;
                     }
 
-                    // Store the shard.
+                    // Store only the raw shard bytes — proof and signature already verified.
                     let mut key = shard.root.to_vec();
                     key.extend(self.name.to_vec());
-                    self.store.write(key, serialized_shard).await;
+                    log::info!("NodesVoter storing shard: {} bytes", shard.shard.len());
+                    self.store.write(key, shard.shard.clone()).await;
 
                     // Reply with a signature.
                     let root = shard.root;

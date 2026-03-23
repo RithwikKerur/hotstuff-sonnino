@@ -2,10 +2,10 @@ use crate::{
     aggregator::{AggregatorService, BatchCertificate},
     batch_maker::{BatchMaker, Transaction},
     certificate_verifier::CertificateVerifier,
-    coded_batch::{AuthenticatedShard, CodedBatch},
+    coded_batch::AuthenticatedShard,
     config::{Committee, Parameters},
     helper::Helper,
-    reconstructor::{Reconstructor, SerializedCodedBatch},
+    reconstructor::Reconstructor,
     synchronizer::Synchronizer,
     voter::{BatchVote, NodesVoter, SelfVoter, SerializedShard},
 };
@@ -35,8 +35,6 @@ pub enum MempoolMessage {
     BatchCertificate(BatchCertificate),
     ShardRequest(Digest, PublicKey),
     ShardReply(AuthenticatedShard),
-    BatchRequest(Digest, PublicKey),
-    CodedBatch(CodedBatch),
 }
 
 pub struct Mempool;
@@ -116,8 +114,6 @@ impl Mempool {
             committee,
             store,
             parameters.sync_retry_delay,
-            parameters.sync_nodes,
-            parameters.sync_bias,
             /* rx_certificate */ rx_consensus,
             tx_missing,
         );
@@ -152,7 +148,6 @@ impl Mempool {
             name,
             committee.clone(),
             signature_service.clone(),
-            store.clone(),
             parameters.batch_size,
             parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
@@ -193,9 +188,8 @@ impl Mempool {
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
         let (tx_certificate_verifier, rx_certificate_verifier) = channel(CHANNEL_CAPACITY);
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
-        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
+        let (tx_helper, rx_helper): (Sender<(Digest, PublicKey)>, Receiver<(Digest, PublicKey)>) = channel(CHANNEL_CAPACITY);
         let (tx_shard, rx_shard) = channel(CHANNEL_CAPACITY);
-        let (tx_batch, rx_batch) = channel(CHANNEL_CAPACITY);
 
         let mut address = committee
             .mempool_address(&name)
@@ -210,7 +204,6 @@ impl Mempool {
                 tx_certificate_verifier,
                 tx_helper,
                 tx_shard,
-                tx_batch,
             },
         );
 
@@ -237,7 +230,7 @@ impl Mempool {
             /* rx_request */ rx_helper,
         );
 
-        Reconstructor::spawn(committee, store, rx_missing, rx_shard, rx_batch);
+        Reconstructor::spawn(name, committee, store, rx_missing, rx_shard);
 
         info!("Mempool listening to mempool messages on {}", address);
     }
@@ -270,9 +263,8 @@ struct MempoolReceiverHandler {
     tx_voter: Sender<(AuthenticatedShard, SerializedShard)>,
     tx_aggregator: Sender<BatchVote>,
     tx_certificate_verifier: Sender<BatchCertificate>,
-    tx_helper: Sender<(Digest, PublicKey, bool)>,
+    tx_helper: Sender<(Digest, PublicKey)>,
     tx_shard: Sender<AuthenticatedShard>,
-    tx_batch: Sender<(CodedBatch, SerializedCodedBatch)>,
 }
 
 #[async_trait]
@@ -300,29 +292,14 @@ impl MessageHandler for MempoolReceiverHandler {
                 .expect("Failed to send certificate"),
             Ok(MempoolMessage::ShardRequest(missing, sender)) => self
                 .tx_helper
-                .send((missing, sender, true))
+                .send((missing, sender))
                 .await
                 .expect("Failed to send shard request"),
-            Ok(MempoolMessage::BatchRequest(missing, sender)) => self
-                .tx_helper
-                .send((missing, sender, false))
+            Ok(MempoolMessage::ShardReply(shard)) => self
+                .tx_shard
+                .send(shard)
                 .await
-                .expect("Failed to send batch request"),
-            Ok(MempoolMessage::ShardReply(shard)) => {
-                // TODO: Ensure that `shard.destination` is the sender of this message. Otherwise
-                // a bad batch creator may send us junk shards impersonating other nodes, and
-                // we won't be able to reconstruct the batch.
-
-                self.tx_shard
-                    .send(shard)
-                    .await
-                    .expect("Failed to send shard");
-            }
-            Ok(MempoolMessage::CodedBatch(batch)) => self
-                .tx_batch
-                .send((batch, serialized.to_vec()))
-                .await
-                .expect("Failed to send batch"),
+                .expect("Failed to send shard"),
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())

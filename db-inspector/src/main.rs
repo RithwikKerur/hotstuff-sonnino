@@ -28,40 +28,75 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut grand_keys: u64 = 0;
-    let mut grand_bytes: u64 = 0;
+    // Shards are stored as raw bytes keyed by root (32 bytes) || pubkey (32 bytes) = 64 bytes.
+    const SHARD_KEY_LEN: usize = 64;
+
+    let mut grand_shard_keys: u64 = 0;
+    let mut grand_shard_bytes: u64 = 0;
+    let mut grand_other_keys: u64 = 0;
+    let mut grand_other_bytes: u64 = 0;
 
     for db_path in &db_dirs {
         let name = db_path.file_name().unwrap().to_string_lossy();
         let db = rocksdb::DB::open_default(db_path)
             .unwrap_or_else(|e| panic!("Failed to open {}: {}", name, e));
 
-        let mut keys: u64 = 0;
-        let mut bytes: u64 = 0;
+        let mut shard_keys: u64 = 0;
+        let mut shard_bytes: u64 = 0;
+        let mut other_keys: u64 = 0;
+        let mut other_bytes: u64 = 0;
+
+        // Track key-length distribution for "other" entries
+        let mut key_len_hist: std::collections::BTreeMap<usize, (u64, u64)> = std::collections::BTreeMap::new();
 
         for (k, v) in db.iterator(rocksdb::IteratorMode::Start) {
-            keys += 1;
-            bytes += k.len() as u64 + v.len() as u64;
+            let entry_bytes = k.len() as u64 + v.len() as u64;
+            if k.len() == SHARD_KEY_LEN {
+                shard_keys += 1;
+                shard_bytes += entry_bytes;
+            } else {
+                other_keys += 1;
+                other_bytes += entry_bytes;
+                let e = key_len_hist.entry(k.len()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += entry_bytes;
+            }
         }
 
+        let shard_avg = if shard_keys > 0 { shard_bytes / shard_keys } else { 0 };
+        println!("=== {} ===", name);
         println!(
-            "{:<12}  {:>8} entries  {:>12} bytes  ({:.2} KB)",
-            name,
-            keys,
-            bytes,
-            bytes as f64 / 1024.0
+            "  Shards (key=64B): {:>6} entries  {:>10} bytes  ({:.2} KB)  avg {:>6} B/entry",
+            shard_keys, shard_bytes, shard_bytes as f64 / 1024.0, shard_avg,
         );
-        grand_keys += keys;
-        grand_bytes += bytes;
+
+        if other_keys > 0 {
+            println!("  Other entries:    {:>6} entries  {:>10} bytes  ({:.2} KB)",
+                other_keys, other_bytes, other_bytes as f64 / 1024.0);
+            for (klen, (count, bytes)) in &key_len_hist {
+                let avg = bytes / count;
+                println!("    key_len={:>4}B: {:>6} entries  {:>10} bytes  avg {:>6} B/entry",
+                    klen, count, bytes, avg);
+            }
+        }
+        println!();
+
+        grand_shard_keys += shard_keys;
+        grand_shard_bytes += shard_bytes;
+        grand_other_keys += other_keys;
+        grand_other_bytes += other_bytes;
     }
 
-    println!("{}", "-".repeat(60));
+    let grand_avg = if grand_shard_keys > 0 { grand_shard_bytes / grand_shard_keys } else { 0 };
+    println!("{}", "=".repeat(72));
     println!(
-        "{:<12}  {:>8} entries  {:>12} bytes  ({:.2} KB)  across {} DBs",
-        "TOTAL",
-        grand_keys,
-        grand_bytes,
-        grand_bytes as f64 / 1024.0,
+        "TOTAL Shards: {:>6} entries  {:>10} bytes  ({:.2} KB)  avg {:>6} B/entry  across {} DBs",
+        grand_shard_keys, grand_shard_bytes, grand_shard_bytes as f64 / 1024.0,
+        grand_avg, db_dirs.len()
+    );
+    println!(
+        "TOTAL Other:  {:>6} entries  {:>10} bytes  ({:.2} KB)  across {} DBs",
+        grand_other_keys, grand_other_bytes, grand_other_bytes as f64 / 1024.0,
         db_dirs.len()
     );
 }

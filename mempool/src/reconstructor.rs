@@ -1,14 +1,11 @@
 use crate::{
     coded_batch::{AuthenticatedShard, CodedBatch, Shard},
     config::Committee,
-    mempool::MempoolMessage,
 };
-use crypto::Digest;
+use crypto::{Digest, PublicKey};
 use log::{debug, warn};
-use smtree::traits::Serializable as _;
 use std::{
     collections::{HashMap, HashSet},
-    convert::TryInto as _,
 };
 use store::Store;
 use tokio::sync::mpsc::Receiver;
@@ -17,10 +14,9 @@ use tokio::sync::mpsc::Receiver;
 #[path = "tests/reconstructor_tests.rs"]
 pub mod reconstructor_tests;
 
-/// Indicates a serialized coded batch.
-pub type SerializedCodedBatch = Vec<u8>;
-
 pub struct Reconstructor {
+    /// The public key of this authority.
+    name: PublicKey,
     /// The committee information.
     committee: Committee,
     /// The persistent storage.
@@ -29,8 +25,6 @@ pub struct Reconstructor {
     rx_missing: Receiver<Digest>,
     /// Receives authenticated shards for the roots we requested.
     rx_shard: Receiver<AuthenticatedShard>,
-    /// Receives coded batches for the roots we requested.
-    rx_batch: Receiver<(CodedBatch, SerializedCodedBatch)>,
     /// Keeps a set of missing batches.
     missing: HashSet<Digest>,
     /// Aggregator helping to reconstruct a batch from its shards.
@@ -39,19 +33,19 @@ pub struct Reconstructor {
 
 impl Reconstructor {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         rx_missing: Receiver<Digest>,
         rx_shard: Receiver<AuthenticatedShard>,
-        rx_batch: Receiver<(CodedBatch, SerializedCodedBatch)>,
     ) {
         tokio::spawn(async move {
             Self {
+                name,
                 committee,
                 store,
                 rx_missing,
                 rx_shard,
-                rx_batch,
                 missing: HashSet::new(),
                 collected_shards: HashMap::new(),
             }
@@ -59,16 +53,14 @@ impl Reconstructor {
             .await;
         });
     }
+
     async fn run(&mut self) {
         loop {
             tokio::select! {
                 Some(root) = self.rx_missing.recv() => {
-                    //debug!("Registering missing batch {}", root);
                     self.missing.insert(root);
                 }
                 Some(shard) = self.rx_shard.recv() => {
-                    //debug!("Received shard of {}", shard.root);
-
                     // Verify the shard.
                     let destination = match self.committee.name(shard.destination) {
                         Some(x) => x,
@@ -84,8 +76,6 @@ impl Reconstructor {
 
                     // Ensure we requested this batch.
                     if !self.missing.contains(&shard.root) {
-                        // NOTE: Do not print a warning since we will likely receive more shards than
-                        // what we need (depending on our sync strategy).
                         continue;
                     }
 
@@ -93,8 +83,7 @@ impl Reconstructor {
                     let size = self.committee.size();
                     let index = shard.destination;
                     let root = shard.root.clone();
-                    self
-                        .collected_shards
+                    self.collected_shards
                         .entry(root.clone())
                         .or_insert_with(|| vec![None; size])[index] = Some(shard.shard);
 
@@ -112,41 +101,21 @@ impl Reconstructor {
 
                         // Reconstruct the batch.
                         let shards = self.collected_shards.remove(&root).unwrap();
-                        let mut batch = CodedBatch::reconstruct(shards, &self.committee)
-                            .expect("Failed to reconstruct batch from verified shards");
+                        match CodedBatch::reconstruct(shards, &self.committee) {
+                            Ok(_) => {
+                                // Store a sentinel at root||name to signal availability
+                                // to the synchronizer. The full batch is not stored since
+                                // each node only retains its own shard.
+                                let mut key = root.to_vec();
+                                key.extend(self.name.to_vec());
+                                self.store.write(key, vec![1u8]).await;
+                            }
+                            Err(e) => warn!("Failed to reconstruct batch {}: {}", root, e),
+                        }
 
-                        // Store the reconstructed batch.
-                        batch.compress(&self.committee);
-                        let message = MempoolMessage::CodedBatch(batch);
-                        let value = bincode::serialize(&message).expect("Failed to serialize coded batch");
-                        self.store.write(root.to_vec(), value).await;
-
-                        // Update the missing batch set.
                         self.missing.remove(&root);
                     }
-
                 },
-                Some((batch, serialized)) = self.rx_batch.recv() => {
-                    // Expand the (compressed) coded batch.
-                    let mut coded_batch = batch;
-                    if let Err(e) = coded_batch.expand(&self.committee) {
-                        warn!("Failed to expand batch: {}", e);
-                        continue;
-                    }
-
-                    // Re-compute the root of the batch.
-                    let tree = coded_batch.commit();
-                    let serialized_root = tree.get_root().serialize();
-                    let root = Digest(serialized_root[0..32].try_into().unwrap());
-
-                    // Ensure we requested this batch.
-                    debug!("Received batch {}", root);
-                    if self.missing.remove(&root) {
-                        // NOTE: We will likely receive more shards than what we need (depending on our sync strategy).
-                        self.collected_shards.remove(&root);
-                        self.store.write(serialized_root, serialized).await;
-                    }
-                }
             }
         }
     }

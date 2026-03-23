@@ -12,7 +12,6 @@ use log::info;
 use network::{CancelHandler, ReliableSender};
 use smtree::traits::Serializable as _;
 use std::{collections::HashMap, convert::TryInto as _};
-use store::Store;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::{sleep, Duration, Instant},
@@ -33,8 +32,6 @@ pub struct BatchMaker {
     committee: Committee,
     /// The service signing digests.
     signature_service: SignatureService,
-    /// the persistent storage.
-    store: Store,
     /// The preferred batch size (in bytes).
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
@@ -57,13 +54,13 @@ pub struct BatchMaker {
     batch_counter: usize,
 }
 
+
 impl BatchMaker {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
         signature_service: SignatureService,
-        store: Store,
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
@@ -75,7 +72,6 @@ impl BatchMaker {
                 name,
                 committee,
                 signature_service,
-                store,
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
@@ -135,6 +131,7 @@ impl BatchMaker {
 
         // Encode the payload using RS erasure codes. We can recover with f+1 shards.
         let batch: Vec<_> = self.current_batch.drain(..).collect();
+        log::info!("Sealing batch: {} bytes ({} txs)", self.current_batch_size, batch.len());
         let coded_batch = CodedBatch::new(batch, self.current_batch_size, &self.committee);
         self.current_batch_size = 0;
 
@@ -147,12 +144,6 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         Self::print_benchmark_info(&batch_clone, batch_size_clone, root.clone());
 
-        // Now that we have the Merkle root, store the coded batch.
-        let mut compressed_batch = coded_batch.clone();
-        compressed_batch.compress(&self.committee);
-        let message = MempoolMessage::CodedBatch(compressed_batch);
-        let value = bincode::serialize(&message).expect("Failed to serialize coded batch");
-        self.store.write(serialized_root, value).await;
         debug!("Sealed batch {}", root);
 
         // Send the root to the certificates aggregator.
