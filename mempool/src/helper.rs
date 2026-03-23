@@ -59,37 +59,35 @@ impl Helper {
                 }
             };
 
-            // Check if we have the requested data.
-            let data = match want_shard {
-                true => {
+            if want_shard {
+                // Send each of our assigned shards to the requestor.
+                let node_idx = self.committee.index(&self.name).unwrap_or(0);
+                let (data_shards, _) = self.committee.shards();
+                for i in (node_idx * data_shards)..((node_idx + 1) * data_shards) {
                     let mut key = root.to_vec();
-                    key.extend(self.name.to_vec());
-                    self.store
-                        .read(key)
-                        .await
-                        .expect("Failed to read store")
-                        .map(|serialized| {
-                            match bincode::deserialize(&serialized)
-                                .expect("Failed to deserialized authenticated shard")
-                            {
-                                MempoolMessage::AuthenticatedShard(shard) => {
-                                    let message = MempoolMessage::ShardReply(shard);
-                                    bincode::serialize(&message).expect("Failed to serialize shard")
-                                }
-                                _ => panic!("Authenticated shard stored in unexpected format"),
+                    key.extend_from_slice(&(i as u64).to_le_bytes());
+                    if let Ok(Some(serialized)) = self.store.read(key).await {
+                        match bincode::deserialize(&serialized) {
+                            Ok(MempoolMessage::AuthenticatedShard(shard)) => {
+                                let message = MempoolMessage::ShardReply(shard);
+                                let reply = bincode::serialize(&message)
+                                    .expect("Failed to serialize shard");
+                                self.network.send(address, Bytes::from(reply)).await;
                             }
-                        })
+                            _ => warn!("Shard stored in unexpected format"),
+                        }
+                    }
                 }
-                false => self
+            } else {
+                // Batch request: look up the full batch by root.
+                let data = self
                     .store
                     .read(root.to_vec())
                     .await
-                    .expect("Failed to read store"),
-            };
-
-            // Reply to the requestor.
-            if let Some(data) = data {
-                self.network.send(address, Bytes::from(data)).await
+                    .expect("Failed to read store");
+                if let Some(data) = data {
+                    self.network.send(address, Bytes::from(data)).await;
+                }
             }
         }
     }

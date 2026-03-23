@@ -4,8 +4,6 @@ use crypto::{Digest, PublicKey};
 use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use log::debug;
 use network::SimpleSender;
-#[cfg(not(test))]
-use rand::Rng as _;
 use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
@@ -82,35 +80,26 @@ impl Synchronizer {
 
     /// Helper function. It waits for a batch to become available in the storage
     /// and then delivers its digest.
-    async fn waiter(missing: Digest, mut store: Store) -> Digest {
+    async fn waiter(missing: Digest, shard_key: Vec<u8>, mut store: Store) -> Digest {
         store
-            .notify_read(missing.to_vec())
+            .notify_read(shard_key)
             .await
             .expect("Failed to read store");
         missing
     }
 
+    fn own_shard_key(root: &Digest, committee: &Committee, name: &PublicKey) -> Vec<u8> {
+        let node_idx = committee.index(name).unwrap_or(0);
+        let (data_shards, _) = committee.shards();
+        let first_shard = (node_idx * data_shards) as u64;
+        let mut key = root.to_vec();
+        key.extend_from_slice(&first_shard.to_le_bytes());
+        key
+    }
+
     async fn sync(&mut self, missing: Digest) {
-        #[cfg(not(test))]
-        let coin = rand::thread_rng().gen_range(0, self.committee.size());
-        #[cfg(test)]
-        let coin = match missing.to_vec()[0] % 2 == 0 {
-            true => 0,
-            false => self.committee.size(),
-        };
-
-        let (message, nodes) = match coin < self.sync_bias {
-            true => (
-                MempoolMessage::ShardRequest(missing, self.name),
-                self.committee.size(),
-            ),
-            false => (
-                MempoolMessage::BatchRequest(missing, self.name),
-                self.sync_nodes,
-            ),
-        };
-
-        let addresses = self
+        let message = MempoolMessage::ShardRequest(missing, self.name);
+        let addresses: Vec<_> = self
             .committee
             .broadcast_addresses(&self.name)
             .iter()
@@ -118,7 +107,7 @@ impl Synchronizer {
             .collect();
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
         self.network
-            .lucky_broadcast(addresses, Bytes::from(serialized), nodes)
+            .lucky_broadcast(addresses, Bytes::from(serialized), self.committee.size())
             .await;
     }
 
@@ -139,10 +128,11 @@ impl Synchronizer {
                             continue;
                         }
 
-                        // Ensure we don't already have the coded batch.
+                        // Ensure we don't already have the own shard for this batch.
+                        let shard_key = Self::own_shard_key(&digest, &self.committee, &self.name);
                         if self
                             .store
-                            .read(digest.to_vec())
+                            .read(shard_key.clone())
                             .await
                             .expect("Failed to read store")
                             .is_some()
@@ -155,7 +145,7 @@ impl Synchronizer {
                             .duration_since(UNIX_EPOCH)
                             .expect("Failed to measure time")
                             .as_millis();
-                        let fut = Self::waiter(digest.clone(), self.store.clone());
+                        let fut = Self::waiter(digest.clone(), shard_key, self.store.clone());
                         waiting.push(fut);
                         self.pending.insert(digest.clone(), now);
 

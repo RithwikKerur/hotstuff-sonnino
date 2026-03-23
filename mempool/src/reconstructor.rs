@@ -1,9 +1,8 @@
 use crate::{
     coded_batch::{AuthenticatedShard, CodedBatch, Shard},
     config::Committee,
-    mempool::MempoolMessage,
 };
-use crypto::Digest;
+use crypto::{Digest, PublicKey};
 use log::{debug, warn};
 use smtree::traits::Serializable as _;
 use std::{
@@ -17,10 +16,9 @@ use tokio::sync::mpsc::Receiver;
 #[path = "tests/reconstructor_tests.rs"]
 pub mod reconstructor_tests;
 
-/// Indicates a serialized coded batch.
-pub type SerializedCodedBatch = Vec<u8>;
-
 pub struct Reconstructor {
+    /// The public key of this authority.
+    name: PublicKey,
     /// The committee information.
     committee: Committee,
     /// The persistent storage.
@@ -29,8 +27,6 @@ pub struct Reconstructor {
     rx_missing: Receiver<Digest>,
     /// Receives authenticated shards for the roots we requested.
     rx_shard: Receiver<AuthenticatedShard>,
-    /// Receives coded batches for the roots we requested.
-    rx_batch: Receiver<(CodedBatch, SerializedCodedBatch)>,
     /// Keeps a set of missing batches.
     missing: HashSet<Digest>,
     /// Aggregator helping to reconstruct a batch from its shards.
@@ -39,19 +35,19 @@ pub struct Reconstructor {
 
 impl Reconstructor {
     pub fn spawn(
+        name: PublicKey,
         committee: Committee,
         store: Store,
         rx_missing: Receiver<Digest>,
         rx_shard: Receiver<AuthenticatedShard>,
-        rx_batch: Receiver<(CodedBatch, SerializedCodedBatch)>,
     ) {
         tokio::spawn(async move {
             Self {
+                name,
                 committee,
                 store,
                 rx_missing,
                 rx_shard,
-                rx_batch,
                 missing: HashSet::new(),
                 collected_shards: HashMap::new(),
             }
@@ -110,41 +106,29 @@ impl Reconstructor {
 
                         // Reconstruct the batch.
                         let shards = self.collected_shards.remove(&root).unwrap();
-                        let mut batch = CodedBatch::reconstruct(shards, &self.committee)
+                        let batch = CodedBatch::reconstruct(shards, &self.committee)
                             .expect("Failed to reconstruct batch from verified shards");
 
-                        // Store the reconstructed batch.
-                        batch.compress(&self.committee);
-                        let message = MempoolMessage::CodedBatch(batch);
-                        let value = bincode::serialize(&message).expect("Failed to serialize coded batch");
-                        self.store.write(root.to_vec(), value).await;
+                        // Store only our own assigned shards.
+                        let node_idx = self.committee.index(&self.name).unwrap_or(0);
+                        let (data_shards, _) = self.committee.shards();
+                        for i in (node_idx * data_shards)..((node_idx + 1) * data_shards) {
+                            if let Some(shard) = batch.shards.get(i) {
+                                let mut key = root.to_vec();
+                                key.extend_from_slice(&(i as u64).to_le_bytes());
+                                self.store.write(key, shard.clone()).await;
+                            }
+                        }
+
+                        // Write a sentinel at the 32-byte root key so the consensus layer
+                        // (Committer / MempoolDriver) can detect payload availability.
+                        self.store.write(root.to_vec(), vec![1u8]).await;
 
                         // Update the missing batch set.
                         self.missing.remove(&root);
                     }
 
                 },
-                Some((batch, serialized)) = self.rx_batch.recv() => {
-                    // Expand the (compressed) coded batch.
-                    let mut coded_batch = batch;
-                    if let Err(e) = coded_batch.expand(&self.committee) {
-                        warn!("Failed to expand batch: {}", e);
-                        continue;
-                    }
-
-                    // Re-compute the root of the batch.
-                    let tree = coded_batch.commit();
-                    let serialized_root = tree.get_root().serialize();
-                    let root = Digest(serialized_root[0..32].try_into().unwrap());
-
-                    // Ensure we requested this batch.
-                    debug!("Received batch {}", root);
-                    if self.missing.remove(&root) {
-                        // NOTE: We will likely receive more shards than what we need (depending on our sync strategy).
-                        self.collected_shards.remove(&root);
-                        self.store.write(serialized_root, serialized).await;
-                    }
-                }
             }
         }
     }

@@ -105,13 +105,20 @@ impl SelfVoter {
                 continue;
             }
 
-            debug!("SelfVoter: storing shard {} for batch {}", shard.destination, shard.root);
+            log::info!(
+                "SelfVoter: shard {} raw={} B, stored={} B",
+                shard.destination, shard.shard.len(), serialized_shard.len()
+            );
 
             // Store the shard, keyed by root||shard_index so multiple shards
             // for the same batch don't overwrite each other.
             let mut key = shard.root.to_vec();
             key.extend_from_slice(&shard.destination.to_le_bytes());
             self.store.write(key, serialized_shard).await;
+
+            // Write a sentinel at the 32-byte root key so the consensus layer
+            // (Committer / MempoolDriver) can detect payload availability.
+            self.store.write(shard.root.to_vec(), vec![1u8]).await;
 
             // Reply with a signature.
             debug!("SelfVoter: voting for batch {}", shard.root);
@@ -177,13 +184,20 @@ impl NodesVoter {
                         continue;
                     }
 
-                    debug!("NodesVoter: storing shard {} for batch {}", shard.destination, shard.root);
+                    log::info!(
+                        "NodesVoter: shard {} raw={} B, stored={} B",
+                        shard.destination, shard.shard.len(), serialized_shard.len()
+                    );
 
                     // Store the shard, keyed by root||shard_index so multiple shards
                     // for the same batch don't overwrite each other.
                     let mut key = shard.root.to_vec();
                     key.extend_from_slice(&shard.destination.to_le_bytes());
                     self.store.write(key, serialized_shard).await;
+
+                    // Write a sentinel at the 32-byte root key so the consensus layer
+                    // (Committer / MempoolDriver) can detect payload availability.
+                    self.store.write(shard.root.to_vec(), vec![1u8]).await;
 
                     // Reply with a signature.
                     let root = shard.root;

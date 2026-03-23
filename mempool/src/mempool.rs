@@ -5,7 +5,7 @@ use crate::{
     coded_batch::{AuthenticatedShard, CodedBatch},
     config::{Committee, Parameters},
     helper::Helper,
-    reconstructor::{Reconstructor, SerializedCodedBatch},
+    reconstructor::Reconstructor,
     shard_cleaner::ShardCleaner,
     synchronizer::Synchronizer,
     voter::{BatchVote, NodesVoter, SelfVoter, SerializedShard},
@@ -160,7 +160,6 @@ impl Mempool {
             name,
             committee.clone(),
             signature_service.clone(),
-            store.clone(),
             parameters.batch_size,
             parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
@@ -206,7 +205,6 @@ impl Mempool {
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_shard, rx_shard) = channel(CHANNEL_CAPACITY);
-        let (tx_batch, rx_batch) = channel(CHANNEL_CAPACITY);
 
         let mut address = committee
             .mempool_address(&name)
@@ -221,7 +219,6 @@ impl Mempool {
                 tx_certificate_verifier,
                 tx_helper,
                 tx_shard,
-                tx_batch,
                 tx_proof,
             },
         );
@@ -249,7 +246,7 @@ impl Mempool {
             /* rx_request */ rx_helper,
         );
 
-        Reconstructor::spawn(committee.clone(), store.clone(), rx_missing, rx_shard, rx_batch);
+        Reconstructor::spawn(name, committee.clone(), store.clone(), rx_missing, rx_shard);
 
         ShardCleaner::spawn(name, committee, store, rx_proof);
 
@@ -286,7 +283,6 @@ struct MempoolReceiverHandler {
     tx_certificate_verifier: Sender<BatchCertificate>,
     tx_helper: Sender<(Digest, PublicKey, bool)>,
     tx_shard: Sender<AuthenticatedShard>,
-    tx_batch: Sender<(CodedBatch, SerializedCodedBatch)>,
     tx_proof: Sender<FullAvailabilityProof>,
 }
 
@@ -333,11 +329,9 @@ impl MessageHandler for MempoolReceiverHandler {
                     .await
                     .expect("Failed to send shard");
             }
-            Ok(MempoolMessage::CodedBatch(batch)) => self
-                .tx_batch
-                .send((batch, serialized.to_vec()))
-                .await
-                .expect("Failed to send batch"),
+            Ok(MempoolMessage::CodedBatch(_)) => {
+                // Nodes no longer store or serve full coded batches; discard.
+            }
             Ok(MempoolMessage::FullAvailabilityProof(proof)) => self
                 .tx_proof
                 .send(proof)
