@@ -206,7 +206,7 @@ impl AggregatorService {
                                 if let Some(proof) = proof_opt {
                                     let root = proof.root.clone();
                                     let _ = aggregators.remove(&root);
-                                    info!("Assembled FullAvailabilityProof for batch {} (all {} nodes responded) — broadcasting shard pruning signal", root, committee.size());
+                                    info!("Assembled FullAvailabilityProof for batch {} (all {} nodes responded)", root, committee.size());
 
                                     // Broadcast to all other nodes.
                                     let addresses = committee

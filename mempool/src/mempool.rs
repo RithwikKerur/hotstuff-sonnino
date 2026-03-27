@@ -59,6 +59,8 @@ impl Mempool {
         rx_consensus: Receiver<Vec<(Digest, PublicKey)>>,
         // Sends messages to consensus.
         tx_consensus: Sender<BatchCertificate>,
+        // Receives committed batch roots from the application layer for shard cleanup.
+        rx_committed_payloads: Receiver<Vec<Digest>>,
     ) {
         // NOTE: This log entry is used to compute performance.
         parameters.log();
@@ -98,6 +100,7 @@ impl Mempool {
             rx_missing,
             tx_proof,
             rx_proof,
+            rx_committed_payloads,
         );
 
         info!(
@@ -189,6 +192,7 @@ impl Mempool {
     }
 
     /// Spawn all tasks responsible to handle messages from other mempools.
+    #[allow(clippy::too_many_arguments)]
     fn handle_mempool_messages(
         name: PublicKey,
         committee: Committee,
@@ -199,6 +203,7 @@ impl Mempool {
         rx_missing: Receiver<Digest>,
         tx_proof: Sender<FullAvailabilityProof>,
         rx_proof: Receiver<FullAvailabilityProof>,
+        rx_committed: Receiver<Vec<Digest>>,
     ) {
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
         let (tx_certificate_verifier, rx_certificate_verifier) = channel(CHANNEL_CAPACITY);
@@ -248,7 +253,7 @@ impl Mempool {
 
         Reconstructor::spawn(name, committee.clone(), store.clone(), rx_missing, rx_shard);
 
-        ShardCleaner::spawn(name, committee, store, rx_proof);
+        ShardCleaner::spawn(name, committee, store, rx_proof, rx_committed);
 
         info!("Mempool listening to mempool messages on {}", address);
     }
@@ -323,7 +328,6 @@ impl MessageHandler for MempoolReceiverHandler {
                 // TODO: Ensure that `shard.destination` is the sender of this message. Otherwise
                 // a bad batch creator may send us junk shards impersonating other nodes, and
                 // we won't be able to reconstruct the batch.
-
                 self.tx_shard
                     .send(shard)
                     .await

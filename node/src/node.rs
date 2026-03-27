@@ -1,16 +1,17 @@
 use crate::config::{Committee, ConfigError, Export as _, Parameters, Secret};
 use consensus::{Block, Consensus};
-use crypto::SignatureService;
+use crypto::{Digest, SignatureService};
 use log::info;
 use mempool::Mempool;
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 /// The default channel capacity for this module.
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
 pub struct Node {
     pub commit: Receiver<Block>,
+    tx_cleanup: Sender<Vec<Digest>>,
 }
 
 impl Node {
@@ -23,6 +24,7 @@ impl Node {
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_to_mempool, rx_consensus_to_mempool) = channel(CHANNEL_CAPACITY);
         let (tx_mempool_to_consensus, rx_mempool_to_consensus) = channel(CHANNEL_CAPACITY);
+        let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
 
         // Read the committee and secret key from file.
         let committee = Committee::read(committee_file)?;
@@ -51,6 +53,7 @@ impl Node {
             store.clone(),
             rx_consensus_to_mempool,
             tx_mempool_to_consensus,
+            rx_cleanup,
         );
 
         // Run the consensus core.
@@ -67,7 +70,7 @@ impl Node {
         );
 
         info!("Node {} successfully booted", name);
-        Ok(Self { commit: rx_commit })
+        Ok(Self { commit: rx_commit, tx_cleanup })
     }
 
     pub fn print_key_file(filename: &str) -> Result<(), ConfigError> {
@@ -75,8 +78,12 @@ impl Node {
     }
 
     pub async fn analyze_block(&mut self) {
-        while let Some(_block) = self.commit.recv().await {
-            // This is where we can further process committed block.
+        while let Some(block) = self.commit.recv().await {
+            // Notify the shard cleaner that these batch roots have been committed/executed.
+            let roots: Vec<Digest> = block.payload.iter().map(|x| x.root.clone()).collect();
+            if !roots.is_empty() {
+                let _ = self.tx_cleanup.send(roots).await;
+            }
         }
     }
 }
