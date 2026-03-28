@@ -8,4 +8,4 @@ name = "db_sizes"
 path = "src/main.rs"
 
 [dependencies]
-rocksdb = "0.15.0"
+rocksdb = "0.21"

@@ -4,6 +4,7 @@
 ///   cargo run -p db-inspector -- benchmark/
 ///
 /// Pass the directory containing .db-* folders as the first argument (default: ".").
+//cargo run -p db-inspector -- ./
 
 fn main() {
     let search_dir = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
@@ -49,7 +50,8 @@ fn main() {
         // Track key-length distribution for "other" entries
         let mut key_len_hist: std::collections::BTreeMap<usize, (u64, u64)> = std::collections::BTreeMap::new();
 
-        for (k, v) in db.iterator(rocksdb::IteratorMode::Start) {
+        for item in db.iterator(rocksdb::IteratorMode::Start) {
+            let (k, v) = item.expect("iterator error");
             let entry_bytes = k.len() as u64 + v.len() as u64;
             if k.len() == SHARD_KEY_LEN {
                 shard_keys += 1;

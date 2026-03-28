@@ -13,7 +13,7 @@ def local(ctx):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 0,
-        'nodes': 4,
+        'nodes': 10,
         'rate': 1_000,
         'tx_size': 512,
         'duration': 20,
@@ -27,7 +27,7 @@ def local(ctx):
             'gc_depth': 50,
             'sync_retry_delay': 5_000,
             'sync_nodes': 3,
-            'sync_bias': 7,
+            'sync_bias': 0,
             'batch_size': 15_000,
             'max_batch_delay': 10
         }
