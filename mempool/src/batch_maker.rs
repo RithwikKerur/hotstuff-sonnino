@@ -131,8 +131,13 @@ impl BatchMaker {
 
         // Encode the payload using RS erasure codes. We can recover with f+1 shards.
         let batch: Vec<_> = self.current_batch.drain(..).collect();
-        log::info!("Sealing batch: {} bytes ({} txs)", self.current_batch_size, batch.len());
         let coded_batch = CodedBatch::new(batch, self.current_batch_size, &self.committee);
+        let num_shards = coded_batch.shards.len();
+        let shard_size = coded_batch.shards.first().map_or(0, |s| s.len());
+        log::info!(
+            "Sealed batch: {} bytes raw, {} shards of {} bytes each",
+            self.current_batch_size, num_shards, shard_size
+        );
         self.current_batch_size = 0;
 
         // Commit to each encoded shard (i.e. build a Merkle tree using the

@@ -105,11 +105,12 @@ impl SelfVoter {
                 continue;
             }
 
-            // Store only the raw shard bytes — proof and signature already verified.
+            // Store the full authenticated shard (shard bytes + Merkle proof + signature).
             let mut key = shard.root.to_vec();
             key.extend(self.name.to_vec());
-            log::info!("SelfVoter storing shard: {} bytes", shard.shard.len());
-            self.store.write(key, shard.shard.clone()).await;
+            let serialized = bincode::serialize(&shard).expect("Failed to serialize authenticated shard");
+            log::info!("SelfVoter storing shard: {} bytes raw, {} bytes stored", shard.shard.len(), serialized.len());
+            self.store.write(key, serialized).await;
 
             // Reply with a signature.
             let vote = BatchVote::new(shard.root, self.name, &mut self.signature_service).await;
@@ -174,11 +175,12 @@ impl NodesVoter {
                         continue;
                     }
 
-                    // Store only the raw shard bytes — proof and signature already verified.
+                    // Store the full authenticated shard (shard bytes + Merkle proof + signature).
                     let mut key = shard.root.to_vec();
                     key.extend(self.name.to_vec());
-                    log::info!("NodesVoter storing shard: {} bytes", shard.shard.len());
-                    self.store.write(key, shard.shard.clone()).await;
+                    let serialized = bincode::serialize(&shard).expect("Failed to serialize authenticated shard");
+                    log::info!("NodesVoter storing shard: {} bytes raw, {} bytes stored", shard.shard.len(), serialized.len());
+                    self.store.write(key, serialized).await;
 
                     // Reply with a signature.
                     let root = shard.root;
