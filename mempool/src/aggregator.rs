@@ -7,7 +7,7 @@ use crate::{
 };
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, Signature};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use network::SimpleSender;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -140,6 +140,8 @@ impl AggregatorService {
                                 let root = certificate.root.clone();
                                 let _ = aggregators.remove(&root);
                                 debug!("Assembled certificate for batch {}", root);
+                                // NOTE: Used for latency plotting.
+                                info!("TIMING availability_proof root={:?}", root);
 
                                 tx_output
                                     .send(certificate.clone())

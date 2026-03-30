@@ -86,6 +86,11 @@ impl Committer {
                     // NOTE: This log entry is used to compute performance.
                     info!("Committed {} -> {:?}", block, x.root);
                 }
+
+                // NOTE: Used for latency plotting.
+                for x in &block.payload {
+                    info!("TIMING block_committed root={:?} block={:?} round={}", x.root, block.digest(), block.round);
+                }
             }
             debug!("Committed {:?}", block);
             if let Err(e) = self.tx_committed.send(block).await {

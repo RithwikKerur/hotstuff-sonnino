@@ -13,7 +13,7 @@ use crate::{
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use crypto::{Hash as _, PublicKey, SignatureService};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use network::SimpleSender;
 use std::cmp::max;
 use store::Store;
@@ -349,6 +349,11 @@ impl Core {
         // Let's see if the payload is correctly formed. The mempool driver also
         // gather the payload if we are missing it.
         self.mempool_driver.verify(block.clone()).await?;
+
+        // NOTE: Used for latency plotting.
+        for x in &block.payload {
+            info!("TIMING block_received root={:?} block={:?} round={}", x.root, block.digest(), block.round);
+        }
 
         // All check pass, we can process this block.
         self.process_block(block).await
