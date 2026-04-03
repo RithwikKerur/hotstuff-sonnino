@@ -83,6 +83,7 @@ impl Proposer {
             for x in &block.payload {
                 // NOTE: This log entry is used to compute performance.
                 info!("Created {} -> {:?}", block, x.root);
+                info!("METRIC batch_proposed round={} root={}", block.round, x.root);
             }
         }
         debug!("Created {:?}", block);

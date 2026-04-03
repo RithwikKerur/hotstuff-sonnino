@@ -85,6 +85,7 @@ impl Committer {
                 for x in &block.payload {
                     // NOTE: This log entry is used to compute performance.
                     info!("Committed {} -> {:?}", block, x.root);
+                    info!("METRIC batch_committed round={} root={}", block.round, x.root);
                 }
             }
             debug!("Committed {:?}", block);

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
+    time::Instant,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -90,6 +91,8 @@ struct Aggregator {
     votes: Vec<(PublicKey, Signature)>,
     used: HashSet<PublicKey>,
     certificate_emitted: bool,
+    /// Wall-clock time when this batch was first tracked (root received from batch_maker).
+    created_at: Instant,
 }
 
 impl Aggregator {
@@ -100,6 +103,7 @@ impl Aggregator {
             votes: Vec::new(),
             used: HashSet::new(),
             certificate_emitted: false,
+            created_at: Instant::now(),
         }
     }
 
@@ -185,7 +189,9 @@ impl AggregatorService {
                             Ok((cert_opt, proof_opt)) => {
                                 if let Some(certificate) = cert_opt {
                                     let root = certificate.root.clone();
+                                    let cert_ms = aggregator.created_at.elapsed().as_millis();
                                     info!("Assembled BatchCertificate for batch {} ({} votes)", root, certificate.votes.len());
+                                    info!("METRIC cert_latency_ms={} root={}", cert_ms, root);
 
                                     tx_output
                                         .send(certificate.clone())
@@ -205,8 +211,10 @@ impl AggregatorService {
 
                                 if let Some(proof) = proof_opt {
                                     let root = proof.root.clone();
+                                    let fap_ms = aggregator.created_at.elapsed().as_millis();
                                     let _ = aggregators.remove(&root);
                                     info!("Assembled FullAvailabilityProof for batch {} (all {} nodes responded) — broadcasting shard pruning signal", root, committee.size());
+                                    info!("METRIC fap_latency_ms={} root={}", fap_ms, root);
 
                                     // Broadcast to all other nodes.
                                     let addresses = committee
