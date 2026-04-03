@@ -1,4 +1,9 @@
-use crate::{aggregator::FullAvailabilityProof, config::Committee};
+use crate::{
+    aggregator::FullAvailabilityProof,
+    config::Committee,
+    mempool::MempoolMessage,
+};
+use bincode;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, warn};
 use std::collections::HashSet;
@@ -47,7 +52,8 @@ impl ShardCleaner {
         });
     }
 
-    /// Drop shards 1..data_shards for this node, keeping only shard 0.
+    /// Reduce the bundle for this node from k shards to 1 (the anchor shard),
+    /// deriving an updated single-leaf Merkle proof from the existing batch proof.
     async fn prune(&mut self, root: &Digest) {
         let (data_shards, _) = self.committee.shards();
         let node_idx = match self.committee.index(&self.name) {
@@ -55,20 +61,48 @@ impl ShardCleaner {
             None => return,
         };
 
-        let kept = node_idx * data_shards;
-        for offset in 1..data_shards {
-            let shard_idx = node_idx * data_shards + offset;
-            let mut key = root.to_vec();
-            key.extend_from_slice(&(shard_idx as u64).to_le_bytes());
-            debug!("Dropping shard {} of batch {}", shard_idx, root);
-            self.store.delete(key).await;
+        let mut key = root.to_vec();
+        key.extend_from_slice(&(node_idx as u64).to_le_bytes());
+
+        let serialized = match self.store.read(key.clone()).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                debug!("Prune: no bundle stored for root {} node {}", root, node_idx);
+                return;
+            }
+            Err(e) => {
+                warn!("Prune: store read error for root {}: {}", root, e);
+                return;
+            }
+        };
+
+        let bundle = match bincode::deserialize::<MempoolMessage>(&serialized) {
+            Ok(MempoolMessage::AuthenticatedShard(s)) => s,
+            _ => {
+                warn!("Prune: unexpected format for root {} node {}", root, node_idx);
+                return;
+            }
+        };
+
+        if bundle.shards.len() == 1 {
+            debug!("Prune: bundle for root {} node {} already pruned", root, node_idx);
+            return;
         }
-        info!(
-            "Pruned batch {}: kept shard {}, dropped {} shards",
-            root,
-            kept,
-            data_shards - 1
-        );
+
+        let pruned = bundle.prune_to_anchor_shard(data_shards);
+        let msg = MempoolMessage::AuthenticatedShard(pruned);
+        match bincode::serialize(&msg) {
+            Ok(bytes) => {
+                self.store.write(key, bytes).await;
+                info!(
+                    "Pruned batch {}: node {} reduced to anchor shard, dropped {} shards",
+                    root,
+                    node_idx,
+                    data_shards - 1
+                );
+            }
+            Err(e) => warn!("Prune: serialize error for root {}: {}", root, e),
+        }
     }
 
     async fn run(&mut self) {

@@ -60,22 +60,19 @@ impl Helper {
             };
 
             if want_shard {
-                // Send each of our assigned shards to the requestor.
+                // Send our bundle (all data_shards for our node_idx) to the requestor.
                 let node_idx = self.committee.index(&self.name).unwrap_or(0);
-                let (data_shards, _) = self.committee.shards();
-                for i in (node_idx * data_shards)..((node_idx + 1) * data_shards) {
-                    let mut key = root.to_vec();
-                    key.extend_from_slice(&(i as u64).to_le_bytes());
-                    if let Ok(Some(serialized)) = self.store.read(key).await {
-                        match bincode::deserialize(&serialized) {
-                            Ok(MempoolMessage::AuthenticatedShard(shard)) => {
-                                let message = MempoolMessage::ShardReply(shard);
-                                let reply = bincode::serialize(&message)
-                                    .expect("Failed to serialize shard");
-                                self.network.send(address, Bytes::from(reply)).await;
-                            }
-                            _ => warn!("Shard stored in unexpected format"),
+                let mut key = root.to_vec();
+                key.extend_from_slice(&(node_idx as u64).to_le_bytes());
+                if let Ok(Some(serialized)) = self.store.read(key).await {
+                    match bincode::deserialize(&serialized) {
+                        Ok(MempoolMessage::AuthenticatedShard(shard)) => {
+                            let message = MempoolMessage::ShardReply(shard);
+                            let reply = bincode::serialize(&message)
+                                .expect("Failed to serialize shard reply");
+                            self.network.send(address, Bytes::from(reply)).await;
                         }
+                        _ => warn!("Shard bundle stored in unexpected format"),
                     }
                 }
             } else {

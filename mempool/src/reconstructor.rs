@@ -1,8 +1,9 @@
 use crate::{
     coded_batch::{AuthenticatedShard, CodedBatch, Shard},
     config::Committee,
+    mempool::MempoolMessage,
 };
-use crypto::{Digest, PublicKey};
+use crypto::{Digest, PublicKey, Signature};
 use log::{debug, warn};
 use smtree::traits::Serializable as _;
 use std::{
@@ -31,6 +32,9 @@ pub struct Reconstructor {
     missing: HashSet<Digest>,
     /// Aggregator helping to reconstruct a batch from its shards.
     collected_shards: HashMap<Digest, Vec<Option<Shard>>>,
+    /// One (author, signature) per root, sourced from a verified received shard.
+    /// Reused to build a valid AuthenticatedShard after reconstruction.
+    sample_authors: HashMap<Digest, (PublicKey, Signature)>,
 }
 
 impl Reconstructor {
@@ -50,6 +54,7 @@ impl Reconstructor {
                 rx_shard,
                 missing: HashSet::new(),
                 collected_shards: HashMap::new(),
+                sample_authors: HashMap::new(),
             }
             .run()
             .await;
@@ -65,13 +70,9 @@ impl Reconstructor {
                 Some(shard) = self.rx_shard.recv() => {
                     //debug!("Received shard of {}", shard.root);
 
-                    // Verify the shard.
+                    // Verify the bundle.
                     let (data_shards, parity_shards) = self.committee.shards();
                     let total_shards = data_shards + parity_shards;
-                    if shard.destination >= total_shards {
-                        warn!("Invalid shard: destination index out of range");
-                        continue;
-                    }
                     if let Err(e) = shard.verify(&self.committee) {
                         warn!("{}", e);
                         continue;
@@ -79,18 +80,25 @@ impl Reconstructor {
 
                     // Ensure we requested this batch.
                     if !self.missing.contains(&shard.root) {
-                        // NOTE: Do not print a warning since we will likely receive more shards than
-                        // what we need (depending on our sync strategy).
                         continue;
                     }
 
-                    // Add the shard to the aggregator.
-                    let index = shard.destination;
+                    // Save one (author, signature) so we can rebuild a valid
+                    // AuthenticatedShard bundle after reconstruction.
                     let root = shard.root.clone();
-                    self
+                    self.sample_authors
+                        .entry(root.clone())
+                        .or_insert_with(|| (shard.author, shard.signature.clone()));
+
+                    // Add each individual shard from the bundle to the aggregator.
+                    let start = shard.node_idx * data_shards;
+                    let entry = self
                         .collected_shards
                         .entry(root.clone())
-                        .or_insert_with(|| vec![None; total_shards])[index] = Some(shard.shard);
+                        .or_insert_with(|| vec![None; total_shards]);
+                    for (j, s) in shard.shards.into_iter().enumerate() {
+                        entry[start + j] = Some(s);
+                    }
 
                     // Check if we have enough shards to reconstruct the batch.
                     let (data_shards, _) = self.committee.shards();
@@ -109,15 +117,31 @@ impl Reconstructor {
                         let batch = CodedBatch::reconstruct(shards, &self.committee)
                             .expect("Failed to reconstruct batch from verified shards");
 
-                        // Store only our own assigned shards.
+                        // Store our assigned bundle, serialized as
+                        // MempoolMessage::AuthenticatedShard so the Helper can
+                        // serve it correctly on sync requests.
                         let node_idx = self.committee.index(&self.name).unwrap_or(0);
                         let (data_shards, _) = self.committee.shards();
-                        for i in (node_idx * data_shards)..((node_idx + 1) * data_shards) {
-                            if let Some(shard) = batch.shards.get(i) {
-                                let mut key = root.to_vec();
-                                key.extend_from_slice(&(i as u64).to_le_bytes());
-                                self.store.write(key, shard.clone()).await;
-                            }
+                        if let Some((author, signature)) = self.sample_authors.remove(&root) {
+                            let tree = batch.commit();
+                            let bundle_shards = batch.shards
+                                [node_idx * data_shards..(node_idx + 1) * data_shards]
+                                .to_vec();
+                            let authenticated = AuthenticatedShard::make_with_signature(
+                                bundle_shards,
+                                node_idx,
+                                data_shards,
+                                &tree,
+                                root.clone(),
+                                author,
+                                signature,
+                            );
+                            let message = MempoolMessage::AuthenticatedShard(authenticated);
+                            let serialized = bincode::serialize(&message)
+                                .expect("Failed to serialize reconstructed shard bundle");
+                            let mut key = root.to_vec();
+                            key.extend_from_slice(&(node_idx as u64).to_le_bytes());
+                            self.store.write(key, serialized).await;
                         }
 
                         // Write a sentinel at the 32-byte root key so the consensus layer

@@ -27,5 +27,9 @@ network = { path = "../network" }
 [dev-dependencies]
 tokio-util = { version = "0.6.2", features= ["codec"] }
 
+[[bin]]
+name = "merkle_bench"
+path = "src/bin/merkle_bench.rs"
+
 [features]
 benchmark = []

@@ -106,14 +106,13 @@ impl SelfVoter {
             }
 
             log::info!(
-                "SelfVoter: shard {} raw={} B, stored={} B",
-                shard.destination, shard.shard.len(), serialized_shard.len()
+                "SelfVoter: node_idx={} shards={} stored={} B",
+                shard.node_idx, shard.shards.len(), serialized_shard.len()
             );
 
-            // Store the shard, keyed by root||shard_index so multiple shards
-            // for the same batch don't overwrite each other.
+            // Store the bundle keyed by root||node_idx.
             let mut key = shard.root.to_vec();
-            key.extend_from_slice(&shard.destination.to_le_bytes());
+            key.extend_from_slice(&(shard.node_idx as u64).to_le_bytes());
             self.store.write(key, serialized_shard).await;
 
             // Write a sentinel at the 32-byte root key so the consensus layer
@@ -185,14 +184,13 @@ impl NodesVoter {
                     }
 
                     log::info!(
-                        "NodesVoter: shard {} raw={} B, stored={} B",
-                        shard.destination, shard.shard.len(), serialized_shard.len()
+                        "NodesVoter: node_idx={} shards={} stored={} B",
+                        shard.node_idx, shard.shards.len(), serialized_shard.len()
                     );
 
-                    // Store the shard, keyed by root||shard_index so multiple shards
-                    // for the same batch don't overwrite each other.
+                    // Store the bundle keyed by root||node_idx.
                     let mut key = shard.root.to_vec();
-                    key.extend_from_slice(&shard.destination.to_le_bytes());
+                    key.extend_from_slice(&(shard.node_idx as u64).to_le_bytes());
                     self.store.write(key, serialized_shard).await;
 
                     // Write a sentinel at the 32-byte root key so the consensus layer

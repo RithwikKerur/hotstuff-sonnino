@@ -156,26 +156,26 @@ impl BatchMaker {
             .await
             .expect("Failed to send root");
 
-        // Disseminate the coded batch.
-        // Each node receives `data_shards` shards: shard at absolute index `i`
-        // goes to node `i / data_shards`.
+        // Disseminate the coded batch: one bundle of `data_shards` shards per node.
         let (data_shards, _) = self.committee.shards();
-        for (i, shard) in coded_batch.shards.into_iter().enumerate() {
-            // Make the coded shard.
+        for node_idx in 0..self.committee.size() {
+            let node_shards = coded_batch.shards
+                [node_idx * data_shards..(node_idx + 1) * data_shards]
+                .to_vec();
             let authenticated_shard = AuthenticatedShard::new(
-                shard,
-                /* destination */ i,
+                node_shards,
+                node_idx,
+                data_shards,
                 &tree,
                 self.name,
                 &mut self.signature_service,
             )
             .await;
 
-            // Multicast the shards to the committee members so that they can sign it.
             let to = self
                 .committee
-                .name(i / data_shards)
-                .expect("Mismatch between committee and shards");
+                .name(node_idx)
+                .expect("Mismatch between committee size and node_idx");
             let message = MempoolMessage::AuthenticatedShard(authenticated_shard.clone());
             let serialized =
                 bincode::serialize(&message).expect("Failed to serialize authenticated shard");

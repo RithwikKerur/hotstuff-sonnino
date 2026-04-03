@@ -12,7 +12,7 @@ use smtree::{
     index::TreeIndex,
     node_template::MTreeNodeSmt,
     proof::MerkleProof,
-    traits::{InclusionProvable as _, Serializable as _},
+    traits::{InclusionProvable as _, Mergeable, Serializable as _},
     tree::SparseMerkleTree,
 };
 use std::convert::TryInto as _;
@@ -129,11 +129,16 @@ type SerializedProof = Vec<u8>;
 /// Convenient shortcut representing a Merkle proof.
 type Proof = MerkleProof<MTreeNodeSmt<blake3::Hasher>>;
 
-/// A self-authenticated encoded batch shard.
+/// A self-authenticated bundle of the `data_shards` erasure-coded shards
+/// assigned to one node (absolute indices `node_idx*k .. (node_idx+1)*k`).
+/// A single batch Merkle proof covers all shards in the bundle.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthenticatedShard {
-    pub shard: Shard,
-    pub destination: usize,
+    /// The `data_shards` shards assigned to this node.
+    pub shards: Vec<Shard>,
+    /// Index of the destination node in the committee.
+    pub node_idx: usize,
+    /// One batch Merkle proof covering all shards in this bundle.
     pub proof: SerializedProof,
     pub root: Digest,
     pub author: PublicKey,
@@ -143,8 +148,8 @@ pub struct AuthenticatedShard {
 #[cfg(test)]
 impl PartialEq for AuthenticatedShard {
     fn eq(&self, other: &Self) -> bool {
-        self.shard == other.shard
-            && self.destination == other.destination
+        self.shards == other.shards
+            && self.node_idx == other.node_idx
             && self.proof == other.proof
             && self.root == other.root
             && self.author == other.author
@@ -155,62 +160,218 @@ impl PartialEq for AuthenticatedShard {
 impl Eq for AuthenticatedShard {}
 
 impl AuthenticatedShard {
-    /// Make a new authenticated batch shard from an encoded shard.
+    fn build_batch_proof(node_idx: usize, data_shards: usize, tree: &Tree) -> Proof {
+        let height = tree.get_height();
+        let indices: Vec<TreeIndex> = (0..data_shards)
+            .map(|j| TreeIndex::from_u64(height, (node_idx * data_shards + j) as u64))
+            .collect();
+        Proof::generate_inclusion_proof(tree, &indices)
+            .expect("Failed to generate batch Merkle proof")
+    }
+
+    /// Create a new authenticated shard bundle for one node.
     pub async fn new(
-        shard: Shard,
-        destination: usize,
+        shards: Vec<Shard>,
+        node_idx: usize,
+        data_shards: usize,
         tree: &Tree,
         author: PublicKey,
         signature_service: &mut SignatureService,
     ) -> Self {
-        // Sign the Merkle root.
         let serialized_root = tree.get_root().serialize();
         let root = Digest(serialized_root[0..32].try_into().unwrap());
         let signature = signature_service.request_signature(root.clone()).await;
+        let proof = Self::build_batch_proof(node_idx, data_shards, tree);
+        Self { shards, node_idx, proof: proof.serialize(), root, author, signature }
+    }
 
-        // Construct the Merkle proof.
-        let index_list = vec![TreeIndex::from_u64(tree.get_height(), destination as u64)];
-        let proof = Proof::generate_inclusion_proof(tree, &index_list)
-            .expect("Failed to generate merkle proof");
+    /// Build a bundle using an existing signature (used by Reconstructor after sync recovery).
+    pub fn make_with_signature(
+        shards: Vec<Shard>,
+        node_idx: usize,
+        data_shards: usize,
+        tree: &Tree,
+        root: Digest,
+        author: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        let proof = Self::build_batch_proof(node_idx, data_shards, tree);
+        Self { shards, node_idx, proof: proof.serialize(), root, author, signature }
+    }
+
+    /// After a batch is committed, reduce this bundle to its first shard by
+    /// deriving a new single-leaf Merkle proof.
+    ///
+    /// The proof is built by running the same bottom-up walk as `verify()` but
+    /// recording the sibling of shard[0]'s path at every level.  No additional
+    /// data is needed beyond the shards and the existing batch proof.
+    pub fn prune_to_anchor_shard(&self, data_shards: usize) -> Self {
+        assert_eq!(self.shards.len(), data_shards, "bundle already pruned");
+
+        let proof = Proof::deserialize(&self.proof).expect("valid proof");
+        let height = proof.get_indexes()[0].get_height();
+        let start = self.node_idx * data_shards;
+        let batch_sibs = proof.get_path_siblings();
+        let mut sib_end = batch_sibs.len();
+
+        // Place leaf hashes at their absolute positions.
+        let level_size = 1usize << height;
+        let mut nodes: Vec<Option<MTreeNodeSmt<blake3::Hasher>>> = vec![None; level_size];
+        for (j, shard) in self.shards.iter().enumerate() {
+            let mut h = blake3::Hasher::new();
+            h.update(shard);
+            h.update(&(start + j).to_le_bytes());
+            let hash = h.finalize();
+            nodes[start + j] = Some(MTreeNodeSmt::new(hash.as_bytes().to_vec()));
+        }
+
+        // Collect single-leaf proof siblings bottom-up (leaf→root order), then reverse.
+        let mut new_sibs: Vec<MTreeNodeSmt<blake3::Hasher>> = Vec::new();
+
+        for level_from_leaf in 1..=height {
+            let next_size = nodes.len() / 2;
+            let mut next: Vec<Option<MTreeNodeSmt<blake3::Hasher>>> = vec![None; next_size];
+
+            // Position of shard[0]'s node in the *current* (pre-merge) nodes array.
+            let path_node = start >> (level_from_leaf - 1);
+            let sibling_node = path_node ^ 1;
+
+            // Case 1: sibling is in nodes (computed from our shards) → capture now.
+            if let Some(sib) = nodes[sibling_node].as_ref() {
+                new_sibs.push(sib.clone());
+            }
+
+            // Standard Option-B bottom-up merge.
+            let mut full: Vec<usize> = Vec::new();
+            let mut incomplete: Vec<usize> = Vec::new();
+            for p in 0..next_size {
+                match (nodes[2 * p].is_some(), nodes[2 * p + 1].is_some()) {
+                    (true, true) => full.push(p),
+                    (true, false) | (false, true) => incomplete.push(p),
+                    (false, false) => {}
+                }
+            }
+            for &p in &full {
+                let lv = nodes[2 * p].take().unwrap();
+                let rv = nodes[2 * p + 1].take().unwrap();
+                next[p] = Some(Mergeable::merge(&lv, &rv));
+            }
+            for &p in incomplete.iter().rev() {
+                let left_exists = nodes[2 * p].is_some();
+                let missing = if left_exists { 2 * p + 1 } else { 2 * p };
+                sib_end -= 1;
+                let sib = &batch_sibs[sib_end];
+                // Case 2: the missing side IS the sibling we need → capture it.
+                if missing == sibling_node {
+                    new_sibs.push(sib.clone());
+                }
+                next[p] = Some(if left_exists {
+                    Mergeable::merge(&nodes[2 * p].take().unwrap(), sib)
+                } else {
+                    Mergeable::merge(sib, &nodes[2 * p + 1].take().unwrap())
+                });
+            }
+            nodes = next;
+        }
+
+        // Reverse to standard root→leaf ordering.
+        new_sibs.reverse();
+        let mut single_proof = Proof::new(TreeIndex::from_u64(height, start as u64));
+        single_proof.set_siblings(new_sibs);
 
         Self {
-            shard,
-            destination,
-            proof: proof.serialize(),
-            root,
-            author,
-            signature,
+            shards: vec![self.shards[0].clone()],
+            node_idx: self.node_idx,
+            proof: single_proof.serialize(),
+            root: self.root.clone(),
+            author: self.author,
+            signature: self.signature.clone(),
         }
     }
 
-    /// Verify the authenticated shard.
+    /// Verify the bundle: signature, shard count, and Merkle inclusion (Option B range verifier).
+    ///
+    /// Accepts both full bundles (`shards.len() == data_shards`, batch proof) and pruned
+    /// bundles (`shards.len() == 1`, single-leaf proof).
     pub fn verify(&self, committee: &Committee) -> MempoolResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             MempoolError::UnknownAuthority(self.author)
         );
-
-        // Deserialize the proof and the tree's root.
-        let deserialized_proof =
-            Proof::deserialize(&self.proof).map_err(|_| MempoolError::BadInclusionProof)?;
-        let deserialized_root = MTreeNodeSmt::deserialize(&self.root.to_vec())
-            .map_err(|_| MempoolError::BadInclusionProof)?;
-
-        // Verify the signature on the Merkle root.
         self.signature.verify(&self.root, &self.author)?;
 
-        // Build the leaf of the Merkle Tree using the absolute shard index,
-        // matching the index used in CodedBatch::commit().
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.shard);
-        hasher.update(&self.destination.to_le_bytes());
-        let hash = hasher.finalize();
-        let leaf = MTreeNodeSmt::new(hash.as_bytes().to_vec());
+        let (data_shards, _) = committee.shards();
+        ensure!(
+            self.shards.len() == data_shards || self.shards.len() == 1,
+            MempoolError::BadInclusionProof
+        );
 
-        // Check the Merkle proof.
-        let ok = deserialized_proof.verify(&leaf, &deserialized_root);
-        ensure!(ok, MempoolError::BadInclusionProof);
+        let proof =
+            Proof::deserialize(&self.proof).map_err(|_| MempoolError::BadInclusionProof)?;
+        let root_node = MTreeNodeSmt::deserialize(&self.root.to_vec())
+            .map_err(|_| MempoolError::BadInclusionProof)?;
+
+        let height = proof
+            .get_indexes()
+            .first()
+            .ok_or(MempoolError::BadInclusionProof)?
+            .get_height();
+
+        let start = self.node_idx * data_shards;
+        let siblings = proof.get_path_siblings();
+        let mut sib_end = siblings.len();
+
+        // Place leaf hashes at their absolute positions.
+        let level_size = 1usize << height;
+        let mut nodes: Vec<Option<MTreeNodeSmt<blake3::Hasher>>> = vec![None; level_size];
+        for (j, shard) in self.shards.iter().enumerate() {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(shard);
+            hasher.update(&(start + j).to_le_bytes());
+            let hash = hasher.finalize();
+            nodes[start + j] = Some(MTreeNodeSmt::new(hash.as_bytes().to_vec()));
+        }
+
+        // Walk bottom-up, pairing adjacent nodes.  Incomplete pairs (one side
+        // outside our range) consume a sibling from the proof in reverse-BFS
+        // order, which means RIGHT-to-LEFT within each level.
+        for _ in (1..=height).rev() {
+            let next_size = nodes.len() / 2;
+            let mut next: Vec<Option<MTreeNodeSmt<blake3::Hasher>>> = vec![None; next_size];
+
+            let mut full: Vec<usize> = Vec::new();
+            let mut incomplete: Vec<usize> = Vec::new();
+            for p in 0..next_size {
+                match (nodes[2 * p].is_some(), nodes[2 * p + 1].is_some()) {
+                    (true, true) => full.push(p),
+                    (true, false) | (false, true) => incomplete.push(p),
+                    (false, false) => {}
+                }
+            }
+
+            for &p in &full {
+                let lv = nodes[2 * p].take().unwrap();
+                let rv = nodes[2 * p + 1].take().unwrap();
+                next[p] = Some(Mergeable::merge(&lv, &rv));
+            }
+            for &p in incomplete.iter().rev() {
+                ensure!(sib_end > 0, MempoolError::BadInclusionProof);
+                sib_end -= 1;
+                let sib = &siblings[sib_end];
+                next[p] = Some(if nodes[2 * p].is_some() {
+                    Mergeable::merge(&nodes[2 * p].take().unwrap(), sib)
+                } else {
+                    Mergeable::merge(sib, &nodes[2 * p + 1].take().unwrap())
+                });
+            }
+
+            nodes = next;
+        }
+
+        ensure!(
+            nodes[0].as_ref() == Some(&root_node),
+            MempoolError::BadInclusionProof
+        );
         Ok(())
     }
 }
