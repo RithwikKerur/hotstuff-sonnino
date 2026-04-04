@@ -3,7 +3,7 @@ from datetime import datetime
 from glob import glob
 from os.path import join
 from re import findall
-from statistics import mean, median, stdev
+from statistics import mean, stdev
 
 import matplotlib.pyplot as plt
 
@@ -190,16 +190,17 @@ class GraphMetrics:
                     ha='center', va='center')
             return
 
-        p50 = median(latencies)
+        sorted_lat = sorted(latencies)
+        p99 = sorted_lat[int(len(sorted_lat) * 0.99)]
 
         ax.hist(latencies, bins=bins, color='tab:green', edgecolor='none')
-        ax.axvline(p50, color='red', linestyle='dashed', linewidth=1.5,
-                   label=f'p50={p50:.0f}ms')
+        ax.axvline(p99, color='red', linestyle='dashed', linewidth=1.5,
+                   label=f'p99={p99:.0f}ms')
 
         ax.set_title(title)
         ax.set_xlabel('ms')
         ax.set_ylabel('count')
-        ax.set_xlim(left=0)
+        ax.set_xlim(left=0, right=p99 * 1.05)
         ax.set_ylim(bottom=0)
         ax.legend()
 
