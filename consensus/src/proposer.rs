@@ -79,6 +79,11 @@ impl Proposer {
         if !block.payload.is_empty() {
             info!("Created {}", block);
 
+            for x in &block.payload {
+                // NOTE: Used for latency plotting.
+                info!("TIMING batch_proposed round={} root={:?}", block.round, x.root);
+            }
+
             #[cfg(feature = "benchmark")]
             for x in &block.payload {
                 // NOTE: This log entry is used to compute performance.

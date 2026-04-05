@@ -27,51 +27,39 @@ class GraphMetrics:
         assert isinstance(nodes, list)
         assert all(isinstance(x, str) for x in nodes)
 
-        # Dicts mapping key -> earliest timestamp seen across all node logs.
-        batch_created: dict = {}        # root -> float (posix seconds)
-        availability_proofs: dict = {}  # root -> float
-        block_received: dict = {}       # block_digest -> float
-        block_committed: dict = {}      # block_digest -> float
+        # cert_latency_ms values pre-computed by the node (aggregator receipt → quorum).
+        cert_latencies: list = []       # int (ms)
+
+        # Dicts mapping root -> earliest timestamp seen across all node logs.
+        batch_proposed: dict = {}       # root -> float (posix seconds)
+        batch_committed: dict = {}      # root -> float
 
         for log in nodes:
-            # TIMING batch_created root=<base64-digest>
+            # METRIC cert_latency_ms=<ms> root=<digest>
+            for ms, _ in findall(
+                r'METRIC cert_latency_ms=(\d+) root=(\S+)', log
+            ):
+                cert_latencies.append(int(ms))
+
+            # TIMING batch_proposed round=<n> root=<digest>
             for t, root in findall(
-                r'\[(.*Z).*TIMING batch_created root=(\S+)', log
+                r'\[(.*Z).*TIMING batch_proposed round=\d+ root=(\S+)', log
             ):
                 ts = self._to_posix(t)
-                if root not in batch_created or batch_created[root] > ts:
-                    batch_created[root] = ts
+                if root not in batch_proposed or batch_proposed[root] > ts:
+                    batch_proposed[root] = ts
 
-            # TIMING availability_proof root=<base64-digest>
+            # TIMING batch_committed round=<n> root=<digest>
             for t, root in findall(
-                r'\[(.*Z).*TIMING availability_proof root=(\S+)', log
+                r'\[(.*Z).*TIMING batch_committed round=\d+ root=(\S+)', log
             ):
                 ts = self._to_posix(t)
-                if root not in availability_proofs or availability_proofs[root] > ts:
-                    availability_proofs[root] = ts
+                if root not in batch_committed or batch_committed[root] > ts:
+                    batch_committed[root] = ts
 
-            # TIMING block_received root=<digest> block=<digest> round=<n>
-            for t, block in findall(
-                r'\[(.*Z).*TIMING block_received root=\S+ block=(\S+) round=\d+',
-                log,
-            ):
-                ts = self._to_posix(t)
-                if block not in block_received or block_received[block] > ts:
-                    block_received[block] = ts
-
-            # TIMING block_committed root=<digest> block=<digest> round=<n>
-            for t, block in findall(
-                r'\[(.*Z).*TIMING block_committed root=\S+ block=(\S+) round=\d+',
-                log,
-            ):
-                ts = self._to_posix(t)
-                if block not in block_committed or block_committed[block] > ts:
-                    block_committed[block] = ts
-
-        self.batch_created = batch_created
-        self.availability_proofs = availability_proofs
-        self.block_received = block_received
-        self.block_committed = block_committed
+        self.cert_latencies = cert_latencies
+        self.batch_proposed = batch_proposed
+        self.batch_committed = batch_committed
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -88,31 +76,22 @@ class GraphMetrics:
 
     def _batch_cert_series(self):
         """
-        Return (t_ms, latency_ms) pairs sorted by completion time, where
-        t_ms is seconds elapsed since the first availability_proof event.
+        Return (index, latency_ms) pairs in arrival order.
+        Latency is pre-computed by the node (aggregator receipt → quorum).
         """
-        pairs = [
-            (self.availability_proofs[root],
-             (self.availability_proofs[root] - self.batch_created[root]) * 1_000)
-            for root in self.availability_proofs
-            if root in self.batch_created
-        ]
-        pairs.sort(key=lambda x: x[0])
-        if not pairs:
-            return [], []
-        t0 = pairs[0][0]
-        return [t - t0 for t, _ in pairs], [lat for _, lat in pairs]
+        latencies = self.cert_latencies
+        return list(range(len(latencies))), list(latencies)
 
     def _block_commit_series(self):
         """
         Return (t_s, latency_ms) pairs sorted by commit time, where t_s is
-        seconds elapsed since the first block_committed event.
+        seconds elapsed since the first batch_committed event.
         """
         pairs = [
-            (self.block_committed[block],
-             (self.block_committed[block] - self.block_received[block]) * 1_000)
-            for block in self.block_committed
-            if block in self.block_received
+            (self.batch_committed[root],
+             (self.batch_committed[root] - self.batch_proposed[root]) * 1_000)
+            for root in self.batch_committed
+            if root in self.batch_proposed
         ]
         pairs.sort(key=lambda x: x[0])
         if not pairs:

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
+    time::Instant,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -64,6 +65,7 @@ struct Aggregator {
     weight: Stake,
     votes: Vec<(PublicKey, Signature)>,
     used: HashSet<PublicKey>,
+    created_at: Instant,
 }
 
 impl Aggregator {
@@ -73,6 +75,7 @@ impl Aggregator {
             weight: 0,
             votes: Vec::new(),
             used: HashSet::new(),
+            created_at: Instant::now(),
         }
     }
 
@@ -138,10 +141,11 @@ impl AggregatorService {
                         match aggregator.append(vote.root, vote.signature, vote.author, &committee) {
                             Ok(Some(certificate)) => {
                                 let root = certificate.root.clone();
+                                let cert_ms = aggregator.created_at.elapsed().as_millis();
                                 let _ = aggregators.remove(&root);
                                 debug!("Assembled certificate for batch {}", root);
                                 // NOTE: Used for latency plotting.
-                                info!("TIMING availability_proof root={:?}", root);
+                                info!("METRIC cert_latency_ms={} root={:?}", cert_ms, root);
 
                                 tx_output
                                     .send(certificate.clone())

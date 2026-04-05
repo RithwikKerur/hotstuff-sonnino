@@ -89,7 +89,7 @@ impl Committer {
 
                 // NOTE: Used for latency plotting.
                 for x in &block.payload {
-                    info!("TIMING block_committed root={:?} block={:?} round={}", x.root, block.digest(), block.round);
+                    info!("TIMING batch_committed round={} root={:?}", block.round, x.root);
                 }
             }
             debug!("Committed {:?}", block);

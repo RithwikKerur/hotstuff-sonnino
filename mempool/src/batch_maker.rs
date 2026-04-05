@@ -150,8 +150,6 @@ impl BatchMaker {
         Self::print_benchmark_info(&batch_clone, batch_size_clone, root.clone());
 
         debug!("Sealed batch {}", root);
-        // NOTE: Used for latency plotting.
-        log::info!("TIMING batch_created root={:?}", root);
 
         // Send the root to the certificates aggregator.
         self.tx_root

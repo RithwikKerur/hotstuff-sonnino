@@ -350,11 +350,6 @@ impl Core {
         // gather the payload if we are missing it.
         self.mempool_driver.verify(block.clone()).await?;
 
-        // NOTE: Used for latency plotting.
-        for x in &block.payload {
-            info!("TIMING block_received root={:?} block={:?} round={}", x.root, block.digest(), block.round);
-        }
-
         // All check pass, we can process this block.
         self.process_block(block).await
     }
