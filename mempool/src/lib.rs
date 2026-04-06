@@ -1,8 +1,8 @@
 mod aggregator;
 mod batch_maker;
 mod certificate_verifier;
-mod coded_batch;
-mod config;
+pub mod coded_batch;
+pub mod config;
 mod error;
 mod helper;
 mod mempool;
