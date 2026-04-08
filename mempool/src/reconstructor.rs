@@ -61,15 +61,14 @@ impl Reconstructor {
                     self.missing.insert(root);
                 }
                 Some(shard) = self.rx_shard.recv() => {
-                    // Verify the shard.
-                    let destination = match self.committee.name(shard.destination) {
-                        Some(x) => x,
-                        None => {
-                            warn!("Invalid shard: Unknown destination node");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = shard.verify(&destination, &self.committee) {
+                    // Verify the shard (uses shard.destination directly).
+                    let (data_shards, parity_shards) = self.committee.shards();
+                    let total_shards = data_shards + parity_shards; // = 2N
+                    if shard.destination >= total_shards {
+                        warn!("Invalid shard: destination {} out of range", shard.destination);
+                        continue;
+                    }
+                    if let Err(e) = shard.verify(&self.committee) {
                         warn!("{}", e);
                         continue;
                     }
@@ -80,15 +79,13 @@ impl Reconstructor {
                     }
 
                     // Add the shard to the aggregator.
-                    let size = self.committee.size();
                     let index = shard.destination;
                     let root = shard.root.clone();
                     self.collected_shards
                         .entry(root.clone())
-                        .or_insert_with(|| vec![None; size])[index] = Some(shard.shard);
+                        .or_insert_with(|| vec![None; total_shards])[index] = Some(shard.shard);
 
                     // Check if we have enough shards to reconstruct the batch.
-                    let (data_shards, _) = self.committee.shards();
                     if self
                         .collected_shards
                         .get(&root)
@@ -99,16 +96,17 @@ impl Reconstructor {
                     {
                         debug!("Reconstructing {}", root);
 
-                        // Reconstruct the batch.
                         let shards = self.collected_shards.remove(&root).unwrap();
                         match CodedBatch::reconstruct(shards, &self.committee) {
                             Ok(_) => {
-                                // Store a sentinel at root||name to signal availability
-                                // to the synchronizer. The full batch is not stored since
-                                // each node only retains its own shard.
-                                let mut key = root.to_vec();
-                                key.extend(self.name.to_vec());
-                                self.store.write(key, vec![1u8]).await;
+                                // Write sentinels so both the synchronizer and the
+                                // consensus payload-waiter fire.
+                                let node_idx = self.committee.index(&self.name).unwrap_or(0);
+                                let first_shard = (2 * node_idx) as u64;
+                                let mut shard_key = root.to_vec();
+                                shard_key.extend_from_slice(&first_shard.to_le_bytes());
+                                self.store.write(shard_key, vec![1u8]).await;
+                                self.store.write(root.to_vec(), vec![1u8]).await;
                             }
                             Err(e) => warn!("Failed to reconstruct batch {}: {}", root, e),
                         }

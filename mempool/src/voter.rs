@@ -1,5 +1,5 @@
 use crate::{
-    coded_batch::AuthenticatedShard,
+    coded_batch::{AuthenticatedBundle, AuthenticatedShard},
     config::Committee,
     ensure,
     error::{MempoolError, MempoolResult},
@@ -55,9 +55,6 @@ impl BatchVote {
 /// Maximum number of votes for which we are waiting for a certificate.
 const MAX_PENDING_VOTES: usize = 100;
 
-/// Represents a serialized authenticated shard.
-pub type SerializedShard = Vec<u8>;
-
 /// Vote for our own batch shards.
 pub struct SelfVoter {
     /// The public key of this authority.
@@ -68,8 +65,8 @@ pub struct SelfVoter {
     store: Store,
     /// The service to sign digests.
     signature_service: SignatureService,
-    /// Receives coded shards.
-    rx_authenticated_shard: Receiver<(AuthenticatedShard, SerializedShard)>,
+    /// Receives the two-shard bundle for our own node.
+    rx_authenticated_shard: Receiver<AuthenticatedBundle>,
     /// Outputs the votes for our own shards.
     tx_vote: Sender<BatchVote>,
 }
@@ -80,7 +77,7 @@ impl SelfVoter {
         committee: Committee,
         store: Store,
         signature_service: SignatureService,
-        rx_authenticated_shard: Receiver<(AuthenticatedShard, SerializedShard)>,
+        rx_authenticated_shard: Receiver<AuthenticatedBundle>,
         tx_vote: Sender<BatchVote>,
     ) {
         tokio::spawn(async move {
@@ -98,23 +95,28 @@ impl SelfVoter {
     }
 
     async fn run(&mut self) {
-        while let Some((shard, _serialized_shard)) = self.rx_authenticated_shard.recv().await {
-            // Verify the shard.
-            if let Err(e) = shard.verify(&self.name, &self.committee) {
-                warn!("{}", e);
-                continue;
-            }
+        while let Some(bundle) = self.rx_authenticated_shard.recv().await {
+            // Verify signature + both Merkle proofs in one call.
+            let (shard_a, shard_b) = match bundle.verify(&self.committee) {
+                Ok(pair) => pair,
+                Err(e) => { warn!("{}", e); continue; }
+            };
 
-            // Store the full authenticated shard (shard bytes + Merkle proof + signature).
-            let mut key = shard.root.to_vec();
-            key.extend(self.name.to_vec());
-            let serialized = bincode::serialize(&shard).expect("Failed to serialize authenticated shard");
-            log::info!("SelfVoter storing shard: {} bytes raw, {} bytes stored", shard.shard.len(), serialized.len());
-            self.store.write(key, serialized).await;
+            // Write sentinel at bare root so the consensus payload-waiter fires.
+            self.store.write(bundle.root.to_vec(), vec![1u8]).await;
 
-            // Reply with a signature.
-            let vote = BatchVote::new(shard.root, self.name, &mut self.signature_service).await;
+            // Vote.
+            let vote = BatchVote::new(bundle.root.clone(), self.name, &mut self.signature_service).await;
             self.tx_vote.send(vote).await.expect("Failed to send vote");
+
+            // Store both shards at numeric keys so the helper can serve them.
+            for shard in [&shard_a, &shard_b] {
+                let serialized = bincode::serialize(shard)
+                    .expect("Failed to serialize authenticated shard");
+                let mut key = shard.root.to_vec();
+                key.extend_from_slice(&(shard.destination as u64).to_le_bytes());
+                self.store.write(key, serialized).await;
+            }
         }
     }
 }
@@ -129,8 +131,8 @@ pub struct NodesVoter {
     store: Store,
     /// The service to sign digests.
     signature_service: SignatureService,
-    /// Receives coded shards.
-    rx_authenticated_shard: Receiver<(AuthenticatedShard, SerializedShard)>,
+    /// Receives the two-shard bundle for this node from the batch leader.
+    rx_authenticated_shard: Receiver<AuthenticatedBundle>,
     /// Receives Merkle roots from consensus allowing to clean up internal state.
     rx_cleanup: Receiver<(PublicKey, Digest)>,
     /// The network sender.
@@ -145,7 +147,7 @@ impl NodesVoter {
         committee: Committee,
         store: Store,
         signature_service: SignatureService,
-        rx_authenticated_shard: Receiver<(AuthenticatedShard, SerializedShard)>,
+        rx_authenticated_shard: Receiver<AuthenticatedBundle>,
         rx_cleanup: Receiver<(PublicKey, Digest)>,
     ) {
         tokio::spawn(async move {
@@ -167,41 +169,44 @@ impl NodesVoter {
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                // Process incoming coded shards.
-                Some((shard, _serialized_shard)) = self.rx_authenticated_shard.recv() => {
-                    // Verify the shard.
-                    if let Err(e) = shard.verify(&self.name, &self.committee) {
-                        warn!("{}", e);
-                        continue;
+                // Process incoming two-shard bundle.
+                Some(bundle) = self.rx_authenticated_shard.recv() => {
+                    // Verify signature + both Merkle proofs.
+                    let (shard_a, shard_b) = match bundle.verify(&self.committee) {
+                        Ok(pair) => pair,
+                        Err(e) => { warn!("{}", e); continue; }
+                    };
+
+                    let root = bundle.root.clone();
+                    let author = bundle.author;
+
+                    // Store both shards at numeric keys.
+                    for shard in [&shard_a, &shard_b] {
+                        let serialized = bincode::serialize(shard)
+                            .expect("Failed to serialize authenticated shard");
+                        let mut key = shard.root.to_vec();
+                        key.extend_from_slice(&(shard.destination as u64).to_le_bytes());
+                        self.store.write(key, serialized).await;
                     }
 
-                    // Store the full authenticated shard (shard bytes + Merkle proof + signature).
-                    let mut key = shard.root.to_vec();
-                    key.extend(self.name.to_vec());
-                    let serialized = bincode::serialize(&shard).expect("Failed to serialize authenticated shard");
-                    log::info!("NodesVoter storing shard: {} bytes raw, {} bytes stored", shard.shard.len(), serialized.len());
-                    self.store.write(key, serialized).await;
+                    // Write sentinel at bare root so the consensus payload-waiter fires.
+                    self.store.write(root.to_vec(), vec![1u8]).await;
 
-                    // Reply with a signature.
-                    let root = shard.root;
+                    // Vote and reply.
                     let vote = BatchVote::new(root.clone(), self.name, &mut self.signature_service).await;
-
-                    // Reply with a vote message.
                     let address = self
                         .committee
-                        .mempool_address(&shard.author)
-                        .expect("Author of valid coded shard is not in the committee");
+                        .mempool_address(&author)
+                        .expect("Author of valid bundle is not in the committee");
                     let message = MempoolMessage::BatchVote(vote);
                     let serialized = bincode::serialize(&message).expect("Failed to serialize vote");
                     let handle = self.network.send(address, Bytes::from(serialized)).await;
-                    let map = self.pending.entry(shard.author).or_insert_with(HashMap::new);
+                    let map = self.pending.entry(author).or_insert_with(HashMap::new);
                     if map.len() >= MAX_PENDING_VOTES {
-                        // TODO: Remove the oldest handler rather than a random one.
-                        // TODO: Keep separate accounting per node.
                         let key = map.keys().next().unwrap().clone();
                         map.retain(|x, _| x != &key);
                     }
-                    map.insert(root, handle);
+                    map.insert(root.clone(), handle);
                 },
                 // Clean up internal state.
                 Some((author, root)) = self.rx_cleanup.recv() => {

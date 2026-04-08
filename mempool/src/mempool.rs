@@ -2,12 +2,12 @@ use crate::{
     aggregator::{AggregatorService, BatchCertificate},
     batch_maker::{BatchMaker, Transaction},
     certificate_verifier::CertificateVerifier,
-    coded_batch::AuthenticatedShard,
+    coded_batch::{AuthenticatedBundle, AuthenticatedShard},
     config::{Committee, Parameters},
     helper::Helper,
     reconstructor::Reconstructor,
     synchronizer::Synchronizer,
-    voter::{BatchVote, NodesVoter, SelfVoter, SerializedShard},
+    voter::{BatchVote, NodesVoter, SelfVoter},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,7 +30,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 /// The message exchanged between the nodes' mempool.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MempoolMessage {
-    AuthenticatedShard(AuthenticatedShard),
+    AuthenticatedBundle(AuthenticatedBundle),
     BatchVote(BatchVote),
     BatchCertificate(BatchCertificate),
     ShardRequest(Digest, PublicKey),
@@ -260,7 +260,7 @@ impl MessageHandler for TxReceiverHandler {
 /// Defines how the network receiver handles incoming mempool messages.
 #[derive(Clone)]
 struct MempoolReceiverHandler {
-    tx_voter: Sender<(AuthenticatedShard, SerializedShard)>,
+    tx_voter: Sender<AuthenticatedBundle>,
     tx_aggregator: Sender<BatchVote>,
     tx_certificate_verifier: Sender<BatchCertificate>,
     tx_helper: Sender<(Digest, PublicKey)>,
@@ -275,11 +275,11 @@ impl MessageHandler for MempoolReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(MempoolMessage::AuthenticatedShard(shard)) => self
+            Ok(MempoolMessage::AuthenticatedBundle(bundle)) => self
                 .tx_voter
-                .send((shard, serialized.to_vec()))
+                .send(bundle)
                 .await
-                .expect("Failed to send shard"),
+                .expect("Failed to send bundle"),
             Ok(MempoolMessage::BatchVote(vote)) => self
                 .tx_aggregator
                 .send(vote)

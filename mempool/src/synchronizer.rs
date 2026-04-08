@@ -63,17 +63,19 @@ impl Synchronizer {
         });
     }
 
-    /// Returns the store key for this node's shard of a batch.
-    fn shard_key(digest: &Digest, name: &PublicKey) -> Vec<u8> {
+    /// Returns the store key for this node's first shard of a batch (index 2*node_idx).
+    fn shard_key(digest: &Digest, committee: &Committee, name: &PublicKey) -> Vec<u8> {
+        let node_idx = committee.index(name).unwrap_or(0);
+        let first_shard = (2 * node_idx) as u64;
         let mut key = digest.to_vec();
-        key.extend(name.to_vec());
+        key.extend_from_slice(&first_shard.to_le_bytes());
         key
     }
 
-    /// Helper function. Waits for this node's shard of a batch to become available.
-    async fn waiter(missing: Digest, name: PublicKey, mut store: Store) -> Digest {
+    /// Helper function. Waits for a specific store key to become available.
+    async fn waiter(missing: Digest, key: Vec<u8>, mut store: Store) -> Digest {
         store
-            .notify_read(Self::shard_key(&missing, &name))
+            .notify_read(key)
             .await
             .expect("Failed to read store");
         missing
@@ -109,10 +111,11 @@ impl Synchronizer {
                             continue;
                         }
 
-                        // Check if we already have our shard for this batch.
+                        // Check if we already have our first shard for this batch.
+                        let key = Self::shard_key(&digest, &self.committee, &self.name);
                         if self
                             .store
-                            .read(Self::shard_key(&digest, &self.name))
+                            .read(key.clone())
                             .await
                             .expect("Failed to read store")
                             .is_some()
@@ -124,7 +127,7 @@ impl Synchronizer {
                             .duration_since(UNIX_EPOCH)
                             .expect("Failed to measure time")
                             .as_millis();
-                        let fut = Self::waiter(digest.clone(), self.name, self.store.clone());
+                        let fut = Self::waiter(digest.clone(), key, self.store.clone());
                         waiting.push(fut);
                         self.pending.insert(digest.clone(), now);
 

@@ -29,8 +29,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Shards are stored as raw bytes keyed by root (32 bytes) || pubkey (32 bytes) = 64 bytes.
-    const SHARD_KEY_LEN: usize = 64;
+    // Shards are stored keyed by root (32 bytes) || shard_index_u64 (8 bytes) = 40 bytes.
+    const SHARD_KEY_LEN: usize = 40;
 
     let mut grand_shard_keys: u64 = 0;
     let mut grand_shard_bytes: u64 = 0;
@@ -68,7 +68,7 @@ fn main() {
         let shard_avg = if shard_keys > 0 { shard_bytes / shard_keys } else { 0 };
         println!("=== {} ===", name);
         println!(
-            "  Shards (key=64B): {:>6} entries  {:>10} bytes  ({:.2} KB)  avg {:>6} B/entry",
+            "  Shards (key=40B): {:>6} entries  {:>10} bytes  ({:.2} KB)  avg {:>6} B/entry",
             shard_keys, shard_bytes, shard_bytes as f64 / 1024.0, shard_avg,
         );
 

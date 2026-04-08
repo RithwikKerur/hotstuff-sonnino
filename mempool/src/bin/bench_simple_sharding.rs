@@ -245,7 +245,7 @@ async fn main() {
             let shard: AuthenticatedShard = bincode::deserialize(payload).unwrap();
             let receiver_pk = committee.name(*node_idx).unwrap();
             shard
-                .verify(&receiver_pk, &committee)
+                .verify(&committee)
                 .unwrap_or_else(|e| panic!("{}", format!("Shard verification failed on run {run}: {e}")));
         }
         verify_times.push(t.elapsed().as_secs_f64() * 1000.0);

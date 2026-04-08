@@ -184,7 +184,8 @@ impl AuthenticatedShard {
     }
 
     /// Verify the authenticated shard.
-    pub fn verify(&self, name: &PublicKey, committee: &Committee) -> MempoolResult<()> {
+    /// Uses `self.destination` as the leaf index in the Merkle tree.
+    pub fn verify(&self, committee: &Committee) -> MempoolResult<()> {
         // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
@@ -200,20 +201,122 @@ impl AuthenticatedShard {
         // Verify the signature on the Merkle root.
         self.signature.verify(&self.root, &self.author)?;
 
-        // Build the leaf of the Merkle Tree.
-        let index = committee
-            .index(name)
-            .expect("Our public key is not in the committee");
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.shard);
-        hasher.update(&index.to_le_bytes());
-        let hash = hasher.finalize();
-        let leaf = MTreeNodeSmt::new(hash.as_bytes().to_vec());
+        // Build the leaf using the absolute shard index (self.destination).
+        let leaf = make_leaf(&self.shard, self.destination);
 
         // Check the Merkle proof.
         let ok = deserialized_proof.verify(&leaf, &deserialized_root);
         ensure!(ok, MempoolError::BadInclusionProof);
         Ok(())
+    }
+}
+
+/// Hash a shard together with its absolute index to form a Merkle leaf.
+fn make_leaf(shard: &[u8], destination: usize) -> MTreeNodeSmt<blake3::Hasher> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(shard);
+    hasher.update(&destination.to_le_bytes());
+    let hash = hasher.finalize();
+    MTreeNodeSmt::new(hash.as_bytes().to_vec())
+}
+
+/// A bundle of two authenticated shards destined for the same node, sharing one signature.
+/// The two shards are at consecutive indices `2i` and `2i+1` for some node index `i`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuthenticatedBundle {
+    pub shard_a: Shard,
+    pub dest_a: usize,
+    pub proof_a: SerializedProof,
+    pub shard_b: Shard,
+    pub dest_b: usize,
+    pub proof_b: SerializedProof,
+    pub root: Digest,
+    pub author: PublicKey,
+    pub signature: Signature,
+}
+
+impl AuthenticatedBundle {
+    /// Build a bundle for one node from two (shard, absolute-index) pairs.
+    /// The signature over the Merkle root is provided externally (signed once per batch).
+    pub fn new(
+        shard_a: Shard,
+        dest_a: usize,
+        shard_b: Shard,
+        dest_b: usize,
+        tree: &Tree,
+        author: PublicKey,
+        signature: Signature,
+    ) -> Self {
+        let serialized_root = tree.get_root().serialize();
+        let root = Digest(serialized_root[0..32].try_into().unwrap());
+        let height = tree.get_height();
+
+        let proof_a = Proof::generate_inclusion_proof(
+            tree,
+            &[TreeIndex::from_u64(height, dest_a as u64)],
+        )
+        .expect("Failed to generate proof for shard_a")
+        .serialize();
+
+        let proof_b = Proof::generate_inclusion_proof(
+            tree,
+            &[TreeIndex::from_u64(height, dest_b as u64)],
+        )
+        .expect("Failed to generate proof for shard_b")
+        .serialize();
+
+        Self { shard_a, dest_a, proof_a, shard_b, dest_b, proof_b, root, author, signature }
+    }
+
+    /// Verify the bundle (one signature check + two Merkle proof checks).
+    /// Returns the two constituent `AuthenticatedShard`s on success.
+    pub fn verify(
+        &self,
+        committee: &Committee,
+    ) -> MempoolResult<(AuthenticatedShard, AuthenticatedShard)> {
+        ensure!(
+            committee.stake(&self.author) > 0,
+            MempoolError::UnknownAuthority(self.author)
+        );
+
+        // One signature check for both shards.
+        self.signature.verify(&self.root, &self.author)?;
+
+        let deserialized_root = MTreeNodeSmt::deserialize(&self.root.to_vec())
+            .map_err(|_| MempoolError::BadInclusionProof)?;
+
+        // Verify shard_a proof.
+        let proof_a = Proof::deserialize(&self.proof_a)
+            .map_err(|_| MempoolError::BadInclusionProof)?;
+        ensure!(
+            proof_a.verify(&make_leaf(&self.shard_a, self.dest_a), &deserialized_root),
+            MempoolError::BadInclusionProof
+        );
+
+        // Verify shard_b proof.
+        let proof_b = Proof::deserialize(&self.proof_b)
+            .map_err(|_| MempoolError::BadInclusionProof)?;
+        ensure!(
+            proof_b.verify(&make_leaf(&self.shard_b, self.dest_b), &deserialized_root),
+            MempoolError::BadInclusionProof
+        );
+
+        let a = AuthenticatedShard {
+            shard: self.shard_a.clone(),
+            destination: self.dest_a,
+            proof: self.proof_a.clone(),
+            root: self.root.clone(),
+            author: self.author,
+            signature: self.signature.clone(),
+        };
+        let b = AuthenticatedShard {
+            shard: self.shard_b.clone(),
+            destination: self.dest_b,
+            proof: self.proof_b.clone(),
+            root: self.root.clone(),
+            author: self.author,
+            signature: self.signature.clone(),
+        };
+        Ok((a, b))
     }
 }

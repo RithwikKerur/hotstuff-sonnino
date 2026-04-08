@@ -1,8 +1,7 @@
 use crate::{
-    coded_batch::{AuthenticatedShard, CodedBatch},
+    coded_batch::{AuthenticatedBundle, CodedBatch},
     config::Committee,
     mempool::MempoolMessage,
-    voter::SerializedShard,
 };
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, SignatureService};
@@ -38,8 +37,8 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-    /// Output channel to deliver shards of transactions batches.
-    tx_authenticated_shard: Sender<(AuthenticatedShard, SerializedShard)>,
+    /// Output channel to deliver the bundle of two shards for our own node.
+    tx_authenticated_shard: Sender<AuthenticatedBundle>,
     /// Send the roots for which we are trying to assemble a certificate.
     tx_root: Sender<Digest>,
     /// Holds the current batch.
@@ -64,7 +63,7 @@ impl BatchMaker {
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
-        tx_authenticated_shard: Sender<(AuthenticatedShard, SerializedShard)>,
+        tx_authenticated_shard: Sender<AuthenticatedBundle>,
         tx_root: Sender<Digest>,
     ) {
         tokio::spawn(async move {
@@ -157,33 +156,38 @@ impl BatchMaker {
             .await
             .expect("Failed to send root");
 
-        // Disseminate the coded batch.
-        for (i, shard) in coded_batch.shards.into_iter().enumerate() {
-            // Make the coded shard.
-            let authenticated_shard = AuthenticatedShard::new(
-                shard,
-                /* destination */ i,
+        // Sign the Merkle root once for all shards.
+        let signature = self.signature_service.request_signature(root.clone()).await;
+
+        // Send two shards per node as one AuthenticatedBundle (2 shards + 2 proofs + 1 sig).
+        let shards = coded_batch.shards;
+        for node_idx in 0..self.committee.size() {
+            let dest_a = 2 * node_idx;
+            let dest_b = 2 * node_idx + 1;
+            let bundle = AuthenticatedBundle::new(
+                shards[dest_a].clone(),
+                dest_a,
+                shards[dest_b].clone(),
+                dest_b,
                 &tree,
                 self.name,
-                &mut self.signature_service,
-            )
-            .await;
+                signature.clone(),
+            );
 
-            // Multicast the shards to the committee members so that they can sign it.
             let to = self
                 .committee
-                .name(i)
+                .name(node_idx)
                 .expect("Mismatch between committee and shards");
-            let message = MempoolMessage::AuthenticatedShard(authenticated_shard.clone());
-            let serialized =
-                bincode::serialize(&message).expect("Failed to serialize authenticated shard");
 
             if to == self.name {
                 self.tx_authenticated_shard
-                    .send((authenticated_shard, serialized))
+                    .send(bundle)
                     .await
-                    .expect("Failed to send our own coded batch to processor");
+                    .expect("Failed to send our own bundle to processor");
             } else {
+                let message = MempoolMessage::AuthenticatedBundle(bundle);
+                let serialized =
+                    bincode::serialize(&message).expect("Failed to serialize bundle");
                 let address = self.committee.mempool_address(&to).unwrap();
                 let handle = self.network.send(address, Bytes::from(serialized)).await;
                 self.pending

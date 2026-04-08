@@ -1,4 +1,4 @@
-use crate::{config::Committee, mempool::MempoolMessage};
+use crate::{coded_batch::AuthenticatedShard, config::Committee, mempool::MempoolMessage};
 use bytes::Bytes;
 use crypto::{Digest, PublicKey};
 use log::warn;
@@ -54,30 +54,22 @@ impl Helper {
                 }
             };
 
-            // Read our own shard for this batch (stored at root || name).
-            let mut key = root.to_vec();
-            key.extend(self.name.to_vec());
-            let data = self
-                .store
-                .read(key)
-                .await
-                .expect("Failed to read store")
-                .and_then(|serialized| {
-                    match bincode::deserialize::<MempoolMessage>(&serialized) {
-                        Ok(MempoolMessage::AuthenticatedShard(shard)) => {
+            // Send both of our assigned shards (indices 2*node_idx and 2*node_idx+1).
+            let node_idx = self.committee.index(&self.name).unwrap_or(0);
+            for dest in [2 * node_idx, 2 * node_idx + 1] {
+                let mut key = root.to_vec();
+                key.extend_from_slice(&(dest as u64).to_le_bytes());
+                if let Ok(Some(serialized)) = self.store.read(key).await {
+                    match bincode::deserialize::<AuthenticatedShard>(&serialized) {
+                        Ok(shard) => {
                             let reply = MempoolMessage::ShardReply(shard);
-                            Some(bincode::serialize(&reply).expect("Failed to serialize shard reply"))
+                            let data = bincode::serialize(&reply)
+                                .expect("Failed to serialize shard reply");
+                            self.network.send(address, Bytes::from(data)).await;
                         }
-                        Ok(_) | Err(_) => {
-                            // Stored value is a sentinel (reconstructed batch) or
-                            // unrecognised format — we cannot serve a proper ShardReply.
-                            None
-                        }
+                        Err(_) => warn!("Shard at dest {} stored in unexpected format", dest),
                     }
-                });
-
-            if let Some(data) = data {
-                self.network.send(address, Bytes::from(data)).await;
+                }
             }
         }
     }

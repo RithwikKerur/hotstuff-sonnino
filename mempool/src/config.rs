@@ -116,10 +116,12 @@ impl Committee {
         2 * total_votes / 3 + 1
     }
 
-    /// Returns the number of data shards and parity shard for erasure coding.
+    /// Returns the number of data shards and parity shards for erasure coding.
+    /// Total shards = 2N (two per node); data_shards = 2f+1, parity_shards = 2N-(2f+1).
+    /// Any 2f+1 shards suffice for reconstruction.
     pub fn shards(&self) -> (usize, usize) {
-        let data_shards = self.validity_threshold() as usize;
-        let parity_shards = (self.total_stake() - self.validity_threshold()) as usize;
+        let data_shards = self.quorum_threshold() as usize;
+        let parity_shards = 2 * self.size() - data_shards;
         (data_shards, parity_shards)
     }
 
