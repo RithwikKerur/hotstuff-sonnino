@@ -1,11 +1,12 @@
 use crate::{
-    aggregator::{AggregatorService, BatchCertificate},
+    aggregator::{AggregatorService, BatchCertificate, FullAvailabilityProof},
     batch_maker::{BatchMaker, Transaction},
     certificate_verifier::CertificateVerifier,
     coded_batch::{AuthenticatedBundle, AuthenticatedShard},
     config::{Committee, Parameters},
     helper::Helper,
     reconstructor::Reconstructor,
+    shard_cleaner::ShardCleaner,
     synchronizer::Synchronizer,
     voter::{BatchVote, NodesVoter, SelfVoter},
 };
@@ -35,6 +36,7 @@ pub enum MempoolMessage {
     BatchCertificate(BatchCertificate),
     ShardRequest(Digest, PublicKey),
     ShardReply(AuthenticatedShard),
+    FullAvailabilityProof(FullAvailabilityProof),
 }
 
 pub struct Mempool;
@@ -61,6 +63,7 @@ impl Mempool {
 
         let (tx_aggregator, rx_aggregator) = channel(CHANNEL_CAPACITY);
         let (tx_missing, rx_missing) = channel(CHANNEL_CAPACITY);
+        let (tx_proof, rx_proof) = channel(CHANNEL_CAPACITY);
 
         // Spawn all mempool tasks.
         Self::handle_consensus_messages(
@@ -80,6 +83,7 @@ impl Mempool {
             tx_consensus.clone(),
             tx_aggregator.clone(),
             rx_aggregator,
+            tx_proof,
         );
         Self::handle_mempool_messages(
             name,
@@ -89,6 +93,7 @@ impl Mempool {
             tx_consensus,
             tx_aggregator,
             rx_missing,
+            rx_proof,
         );
 
         info!(
@@ -130,6 +135,7 @@ impl Mempool {
         tx_consensus: Sender<BatchCertificate>,
         tx_aggregator: Sender<BatchVote>,
         rx_aggregator: Receiver<BatchVote>,
+        tx_self_proof: Sender<FullAvailabilityProof>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
@@ -170,6 +176,7 @@ impl Mempool {
             rx_root,
             /* rx_vote */ rx_aggregator,
             /* tx_output */ tx_consensus,
+            /* tx_self_proof */ tx_self_proof,
         );
 
         info!("Mempool listening to client transactions on {}", address);
@@ -184,12 +191,14 @@ impl Mempool {
         tx_consensus: Sender<BatchCertificate>,
         tx_aggregator: Sender<BatchVote>,
         rx_missing: Receiver<Digest>,
+        rx_proof: Receiver<FullAvailabilityProof>,
     ) {
         let (tx_voter, rx_voter) = channel(CHANNEL_CAPACITY);
         let (tx_certificate_verifier, rx_certificate_verifier) = channel(CHANNEL_CAPACITY);
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
         let (tx_helper, rx_helper): (Sender<(Digest, PublicKey)>, Receiver<(Digest, PublicKey)>) = channel(CHANNEL_CAPACITY);
         let (tx_shard, rx_shard) = channel(CHANNEL_CAPACITY);
+        let (tx_network_proof, rx_network_proof) = channel(CHANNEL_CAPACITY);
 
         let mut address = committee
             .mempool_address(&name)
@@ -204,6 +213,7 @@ impl Mempool {
                 tx_certificate_verifier,
                 tx_helper,
                 tx_shard,
+                tx_proof: tx_network_proof,
             },
         );
 
@@ -230,7 +240,10 @@ impl Mempool {
             /* rx_request */ rx_helper,
         );
 
-        Reconstructor::spawn(name, committee, store, rx_missing, rx_shard);
+        Reconstructor::spawn(name, committee.clone(), store.clone(), rx_missing, rx_shard);
+
+        // Merge proofs from the network and from the local AggregatorService into one channel.
+        ShardCleaner::spawn(name, committee, store, rx_network_proof, rx_proof);
 
         info!("Mempool listening to mempool messages on {}", address);
     }
@@ -265,6 +278,7 @@ struct MempoolReceiverHandler {
     tx_certificate_verifier: Sender<BatchCertificate>,
     tx_helper: Sender<(Digest, PublicKey)>,
     tx_shard: Sender<AuthenticatedShard>,
+    tx_proof: Sender<FullAvailabilityProof>,
 }
 
 #[async_trait]
@@ -300,6 +314,11 @@ impl MessageHandler for MempoolReceiverHandler {
                 .send(shard)
                 .await
                 .expect("Failed to send shard"),
+            Ok(MempoolMessage::FullAvailabilityProof(proof)) => self
+                .tx_proof
+                .send(proof)
+                .await
+                .expect("Failed to send full availability proof"),
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())
