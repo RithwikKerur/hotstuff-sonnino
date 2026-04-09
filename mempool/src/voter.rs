@@ -102,21 +102,21 @@ impl SelfVoter {
                 Err(e) => { warn!("{}", e); continue; }
             };
 
-            // Write sentinel at bare root so the consensus payload-waiter fires.
-            self.store.write(bundle.root.to_vec(), vec![1u8]).await;
-
-            // Vote.
-            let vote = BatchVote::new(bundle.root.clone(), self.name, &mut self.signature_service).await;
-            self.tx_vote.send(vote).await.expect("Failed to send vote");
-
-            // Store both shards at numeric keys so the helper can serve them.
+            // Commit both shards + sentinel atomically in one RocksDB write.
+            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(3);
             for shard in [&shard_a, &shard_b] {
                 let serialized = bincode::serialize(shard)
                     .expect("Failed to serialize authenticated shard");
                 let mut key = shard.root.to_vec();
                 key.extend_from_slice(&(shard.destination as u64).to_le_bytes());
-                self.store.write(key, serialized).await;
+                batch.push((key, serialized));
             }
+            batch.push((bundle.root.to_vec(), vec![1u8]));
+            self.store.write_batch(batch).await;
+
+            // Vote.
+            let vote = BatchVote::new(bundle.root.clone(), self.name, &mut self.signature_service).await;
+            self.tx_vote.send(vote).await.expect("Failed to send vote");
         }
     }
 }
@@ -180,17 +180,17 @@ impl NodesVoter {
                     let root = bundle.root.clone();
                     let author = bundle.author;
 
-                    // Store both shards at numeric keys.
+                    // Commit both shards + sentinel atomically in one RocksDB write.
+                    let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(3);
                     for shard in [&shard_a, &shard_b] {
                         let serialized = bincode::serialize(shard)
                             .expect("Failed to serialize authenticated shard");
                         let mut key = shard.root.to_vec();
                         key.extend_from_slice(&(shard.destination as u64).to_le_bytes());
-                        self.store.write(key, serialized).await;
+                        batch.push((key, serialized));
                     }
-
-                    // Write sentinel at bare root so the consensus payload-waiter fires.
-                    self.store.write(root.to_vec(), vec![1u8]).await;
+                    batch.push((root.to_vec(), vec![1u8]));
+                    self.store.write_batch(batch).await;
 
                     // Vote and reply.
                     let vote = BatchVote::new(root.clone(), self.name, &mut self.signature_service).await;

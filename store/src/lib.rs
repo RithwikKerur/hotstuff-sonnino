@@ -16,6 +16,7 @@ type Value = Vec<u8>;
 
 pub enum StoreCommand {
     Write(Key, Value),
+    WriteBatch(Vec<(Key, Value)>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
     Delete(Key),
@@ -39,6 +40,21 @@ impl Store {
                         if let Some(mut senders) = obligations.remove(&key) {
                             while let Some(s) = senders.pop_front() {
                                 let _ = s.send(Ok(value.clone()));
+                            }
+                        }
+                    }
+                    StoreCommand::WriteBatch(pairs) => {
+                        let mut batch = rocksdb::WriteBatch::default();
+                        for (k, v) in &pairs {
+                            batch.put(k, v);
+                        }
+                        let _ = db.write(batch);
+                        // Fire any notify_read listeners for keys in this batch.
+                        for (k, v) in pairs {
+                            if let Some(mut senders) = obligations.remove(&k) {
+                                while let Some(s) = senders.pop_front() {
+                                    let _ = s.send(Ok(v.clone()));
+                                }
                             }
                         }
                     }
@@ -81,6 +97,12 @@ impl Store {
         receiver
             .await
             .expect("Failed to receive reply to Read command from store")
+    }
+
+    pub async fn write_batch(&mut self, pairs: Vec<(Key, Value)>) {
+        if let Err(e) = self.channel.send(StoreCommand::WriteBatch(pairs)).await {
+            panic!("Failed to send WriteBatch command to store: {}", e);
+        }
     }
 
     pub async fn delete(&mut self, key: Key) {
