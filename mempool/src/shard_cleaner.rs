@@ -1,6 +1,6 @@
 use crate::{aggregator::FullAvailabilityProof, config::Committee};
 use crypto::PublicKey;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -38,6 +38,8 @@ impl ShardCleaner {
             Some(i) => i,
             None => return,
         };
+
+        info!("Received FullAvailabilityProof for batch {}", proof.root);
 
         // Drop the second shard (dest = 2*node_idx+1); keep the first for reconstruction.
         let dest_b = (2 * node_idx + 1) as u64;
