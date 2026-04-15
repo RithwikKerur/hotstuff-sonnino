@@ -203,8 +203,14 @@ impl AggregatorService {
 
                                 if let Some(proof) = proof_opt {
                                     let root = proof.root.clone();
+                                    let proof_ms = aggregator.created_at.elapsed().as_millis();
                                     let _ = aggregators.remove(&root);
                                     debug!("Assembled FullAvailabilityProof for batch {}", root);
+                                    // Log off the event-loop thread so the synchronous write
+                                    // doesn't stall vote processing for other batches.
+                                    tokio::task::spawn_blocking(move || {
+                                        info!("METRIC full_proof_latency_ms={} root={:?}", proof_ms, root);
+                                    });
 
                                     // Broadcast to all other nodes.
                                     let addresses = committee

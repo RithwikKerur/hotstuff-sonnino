@@ -30,6 +30,9 @@ class GraphMetrics:
         # cert_latency_ms values pre-computed by the node (aggregator receipt → quorum).
         cert_latencies: list = []       # int (ms)
 
+        # full_proof_latency_ms values pre-computed by the node (aggregator receipt → all-N voted).
+        full_proof_latencies: list = [] # int (ms)
+
         # Dicts mapping root -> earliest timestamp seen across all node logs.
         batch_proposed: dict = {}       # root -> float (posix seconds)
         batch_committed: dict = {}      # root -> float
@@ -40,6 +43,12 @@ class GraphMetrics:
                 r'METRIC cert_latency_ms=(\d+) root=(\S+)', log
             ):
                 cert_latencies.append(int(ms))
+
+            # METRIC full_proof_latency_ms=<ms> root=<digest>
+            for ms, _ in findall(
+                r'METRIC full_proof_latency_ms=(\d+) root=(\S+)', log
+            ):
+                full_proof_latencies.append(int(ms))
 
             # TIMING batch_proposed round=<n> root=<digest>
             for t, root in findall(
@@ -58,6 +67,7 @@ class GraphMetrics:
                     batch_committed[root] = ts
 
         self.cert_latencies = cert_latencies
+        self.full_proof_latencies = full_proof_latencies
         self.batch_proposed = batch_proposed
         self.batch_committed = batch_committed
 
@@ -82,6 +92,14 @@ class GraphMetrics:
         latencies = self.cert_latencies
         return list(range(len(latencies))), list(latencies)
 
+    def _full_proof_series(self):
+        """
+        Return (index, latency_ms) pairs in arrival order.
+        Latency is pre-computed by the node (aggregator receipt → all-N voted).
+        """
+        latencies = self.full_proof_latencies
+        return list(range(len(latencies))), list(latencies)
+
     def _block_commit_series(self):
         """
         Return (t_s, latency_ms) pairs sorted by commit time, where t_s is
@@ -102,6 +120,15 @@ class GraphMetrics:
     def batch_cert_latency_ms(self):
         """Returns (mean_ms, stdev_ms, sample_count)."""
         _, latencies = self._batch_cert_series()
+        if not latencies:
+            return None, None, 0
+        mean_ms = mean(latencies)
+        std_ms = stdev(latencies) if len(latencies) > 1 else 0.0
+        return mean_ms, std_ms, len(latencies)
+
+    def full_proof_latency_ms(self):
+        """Returns (mean_ms, stdev_ms, sample_count) for FullAvailabilityProof generation."""
+        _, latencies = self._full_proof_series()
         if not latencies:
             return None, None, 0
         mean_ms = mean(latencies)
@@ -136,13 +163,14 @@ class GraphMetrics:
 
         _, bc_latencies = self._batch_cert_series()
         _, bl_latencies = self._block_commit_series()
+        _, fp_latencies = self._full_proof_series()
 
-        if not bc_latencies and not bl_latencies:
+        if not bc_latencies and not bl_latencies and not fp_latencies:
             print('[graph_metrics] No data found, skipping plot.')
             return
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        fig.suptitle('HotStuff mempool latency metrics', fontweight='bold')
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle('Rafture mempool latency metrics', fontweight='bold')
 
         self._plot_histogram(
             ax=axes[0],
@@ -154,6 +182,12 @@ class GraphMetrics:
             ax=axes[1],
             latencies=bl_latencies,
             title='Block commit latency\n(proposed \u2192 committed)',
+            bins=bins,
+        )
+        self._plot_histogram(
+            ax=axes[2],
+            latencies=fp_latencies,
+            title='FullAvailabilityProof latency\n(sealed \u2192 all-N voted)',
             bins=bins,
         )
 
@@ -190,6 +224,7 @@ class GraphMetrics:
     def result(self):
         bc_mean, bc_std, bc_n = self.batch_cert_latency_ms()
         bl_mean, bl_std, bl_n = self.block_commit_latency_ms()
+        fp_mean, fp_std, fp_n = self.full_proof_latency_ms()
 
         def _fmt(mean_ms, std_ms, n):
             if mean_ms is None:
@@ -198,12 +233,13 @@ class GraphMetrics:
 
         return (
             '\n'
-            '-----------------------------------------\n'
+            '---------------------------------------------------\n'
             ' GRAPH METRICS (latency breakdown):\n'
-            '-----------------------------------------\n'
-            f' BatchCert latency:    {_fmt(bc_mean, bc_std, bc_n)}\n'
-            f' Block Commit latency: {_fmt(bl_mean, bl_std, bl_n)}\n'
-            '-----------------------------------------\n'
+            '---------------------------------------------------\n'
+            f' BatchCert latency:           {_fmt(bc_mean, bc_std, bc_n)}\n'
+            f' FullAvailabilityProof latency:{_fmt(fp_mean, fp_std, fp_n)}\n'
+            f' Block Commit latency:         {_fmt(bl_mean, bl_std, bl_n)}\n'
+            '---------------------------------------------------\n'
         )
 
     def print(self):
