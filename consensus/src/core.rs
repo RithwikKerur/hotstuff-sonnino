@@ -15,7 +15,8 @@ use crypto::{PublicKey, SignatureService};
 use log::{debug, error, info, warn};
 use network::SimpleSender;
 use std::cmp::max;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -42,6 +43,9 @@ pub struct Core {
     timer: Timer,
     aggregator: Aggregator,
     network: SimpleSender,
+    // Phase timing: keyed by round number.
+    phase1_start: HashMap<Round, Instant>, // when process_block first sees the block
+    phase1_end: HashMap<Round, Instant>,   // when the node casts its vote (phase 1 done)
 }
 
 impl Core {
@@ -80,6 +84,8 @@ impl Core {
                 timer: Timer::new(timeout_delay),
                 aggregator: Aggregator::new(committee),
                 network: SimpleSender::new(),
+                phase1_start: HashMap::new(),
+                phase1_end: HashMap::new(),
             }
             .run()
             .await
@@ -137,8 +143,26 @@ impl Core {
         // Save the last committed block.
         self.last_committed_round = block.round;
 
+        // Snapshot the commit time once; all blocks in the batch are committed together.
+        let commit_time = Instant::now();
+
         // Send all the newly committed blocks to the node's application layer.
         while let Some(block) = to_commit.pop_back() {
+            // Log phase timing for this block if we recorded both phase boundaries.
+            if let (Some(&p1_start), Some(&p1_end)) = (
+                self.phase1_start.get(&block.round),
+                self.phase1_end.get(&block.round),
+            ) {
+                let phase1_ms = (p1_end - p1_start).as_secs_f64() * 1000.0;
+                let phase2_ms = (commit_time - p1_end).as_secs_f64() * 1000.0;
+                info!(
+                    "PHASE_TIMING round={} phase1_ms={:.3} phase2_ms={:.3}",
+                    block.round, phase1_ms, phase2_ms
+                );
+            }
+            self.phase1_start.remove(&block.round);
+            self.phase1_end.remove(&block.round);
+
             if !block.payload.is_empty() {
                 info!("Committed {}", block);
 
@@ -212,6 +236,10 @@ impl Core {
         // Add the new vote to our aggregator and see if we have a quorum.
         if let Some(qc) = self.aggregator.add_vote(vote.clone())? {
             debug!("Assembled {:?}", qc);
+
+            // Phase 1 ends here: this node has collected a quorum of votes and
+            // formed a QC. Only the vote-collecting leader reaches this point.
+            self.phase1_end.insert(qc.round, Instant::now());
 
             // Process the QC.
             self.process_qc(&qc).await;
@@ -309,6 +337,11 @@ impl Core {
     #[async_recursion]
     async fn process_block(&mut self, block: &Block) -> ConsensusResult<()> {
         debug!("Processing {:?}", block);
+
+        // Record Phase 1 start: the first time this node sees the block.
+        self.phase1_start
+            .entry(block.round)
+            .or_insert_with(Instant::now);
 
         // Let's see if we have the last three ancestors of the block, that is:
         //      b0 <- |qc0; b1| <- |qc1; block|

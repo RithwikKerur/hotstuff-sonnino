@@ -14,7 +14,7 @@ def local(ctx):
     bench_params = {
         "faults": 0,
         "nodes": 4,
-        "rate": 1_000,
+        "rate": 100_000,
         "tx_size": 512,
         "duration": 20,
     }
@@ -27,7 +27,7 @@ def local(ctx):
             "gc_depth": 50,
             "sync_retry_delay": 5_000,
             "sync_retry_nodes": 3,
-            "batch_size": 15_000,
+            "batch_size": 150_000,
             "max_batch_delay": 10,
         },
     }
