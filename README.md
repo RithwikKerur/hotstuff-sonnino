@@ -1,5 +1,5 @@
 # HotStuff with Proof of Availability
-
+This code implements lazy-dolphin but has the leader send out 2 fragments initially and prune down to 1 upon receiving sufficient responses. It also use a (2F+1, 2N) encoding scheme instead of (F+1, N)
 [![build status](https://img.shields.io/github/workflow/status/asonnino/hotstuff/Build/lazy-dolphin?style=flat-square&logo=github)](https://github.com/asonnino/hotstuff/actions)
 [![rustc](https://img.shields.io/badge/rustc-1.51+-blue?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![license](https://img.shields.io/badge/license-Apache-blue.svg?style=flat-square)](LICENSE)
