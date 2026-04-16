@@ -19,7 +19,8 @@ pub struct Block {
     pub tc: Option<TC>,
     pub author: PublicKey,
     pub round: Round,
-    pub payload: Vec<Digest>,
+    /// Each entry is a serialized batch of transactions from the leader's mempool.
+    pub payload: Vec<Vec<u8>>,
     pub signature: Signature,
 }
 
@@ -29,7 +30,7 @@ impl Block {
         tc: Option<TC>,
         author: PublicKey,
         round: Round,
-        payload: Vec<Digest>,
+        payload: Vec<Vec<u8>>,
         mut signature_service: SignatureService,
     ) -> Self {
         let block = Self {
@@ -98,7 +99,7 @@ impl fmt::Debug for Block {
             self.author,
             self.round,
             self.qc,
-            self.payload.iter().map(|x| x.size()).sum::<usize>(),
+            self.payload.iter().map(|x| x.len()).sum::<usize>(),
         )
     }
 }

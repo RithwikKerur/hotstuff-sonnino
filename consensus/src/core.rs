@@ -3,7 +3,6 @@ use crate::config::Committee;
 use crate::consensus::{ConsensusMessage, Round};
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
-use crate::mempool::MempoolDriver;
 use crate::messages::{Block, Timeout, Vote, QC, TC};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
@@ -11,11 +10,14 @@ use crate::timer::Timer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use crypto::Hash as _;
-use crypto::{PublicKey, SignatureService};
+use crypto::{Digest, PublicKey, SignatureService};
+use ed25519_dalek::Digest as _;
+use ed25519_dalek::Sha512;
 use log::{debug, error, info, warn};
 use network::SimpleSender;
 use std::cmp::max;
 use std::collections::{HashMap, VecDeque};
+use std::convert::TryInto;
 use std::time::Instant;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -30,7 +32,6 @@ pub struct Core {
     store: Store,
     signature_service: SignatureService,
     leader_elector: LeaderElector,
-    mempool_driver: MempoolDriver,
     synchronizer: Synchronizer,
     rx_message: Receiver<ConsensusMessage>,
     rx_loopback: Receiver<Block>,
@@ -56,7 +57,6 @@ impl Core {
         signature_service: SignatureService,
         store: Store,
         leader_elector: LeaderElector,
-        mempool_driver: MempoolDriver,
         synchronizer: Synchronizer,
         timeout_delay: u64,
         rx_message: Receiver<ConsensusMessage>,
@@ -71,7 +71,6 @@ impl Core {
                 signature_service,
                 store,
                 leader_elector,
-                mempool_driver,
                 synchronizer,
                 rx_message,
                 rx_loopback,
@@ -168,8 +167,14 @@ impl Core {
 
                 #[cfg(feature = "benchmark")]
                 for x in &block.payload {
+                    // Recompute the digest so it matches what the BatchMaker logged.
+                    let digest = Digest(
+                        Sha512::digest(x.as_slice()).as_slice()[..32]
+                            .try_into()
+                            .expect("SHA-512 digest is always ≥ 32 bytes"),
+                    );
                     // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", block, x);
+                    info!("Committed {} -> {:?}", block, digest);
                 }
             }
             debug!("Committed {:?}", block);
@@ -315,13 +320,21 @@ impl Core {
             .expect("Failed to send message to proposer");
     }
 
+    /// Tell the proposer to drop any buffered batches that were already committed
+    /// in blocks b0, b1, or block.
     async fn cleanup_proposer(&mut self, b0: &Block, b1: &Block, block: &Block) {
-        let digests = b0
+        let digests: Vec<Digest> = b0
             .payload
             .iter()
-            .cloned()
-            .chain(b1.payload.iter().cloned())
-            .chain(block.payload.iter().cloned())
+            .chain(b1.payload.iter())
+            .chain(block.payload.iter())
+            .map(|batch| {
+                Digest(
+                    Sha512::digest(batch.as_slice()).as_slice()[..32]
+                        .try_into()
+                        .expect("SHA-512 digest is always ≥ 32 bytes"),
+                )
+            })
             .collect();
         self.tx_proposer
             .send(ProposerMessage::Cleanup(digests))
@@ -345,7 +358,7 @@ impl Core {
 
         // Let's see if we have the last three ancestors of the block, that is:
         //      b0 <- |qc0; b1| <- |qc1; block|
-        // If we don't, the synchronizer asks for them to other nodes. It will
+        // If we don't, the synchronizer asks for them from other nodes. It will
         // then ensure we process both ancestors in the correct order, and
         // finally make us resume processing this block.
         let (b0, b1) = match self.synchronizer.get_ancestors(block).await? {
@@ -362,9 +375,8 @@ impl Core {
         self.cleanup_proposer(&b0, &b1, block).await;
 
         // Check if we can commit the head of the 2-chain.
-        // Note that we commit blocks only if we have all its ancestors.
+        // Note that we commit blocks only if we have all their ancestors.
         if b0.round + 1 == b1.round {
-            self.mempool_driver.cleanup(b0.round).await;
             self.commit(b0).await?;
         }
 
@@ -419,14 +431,7 @@ impl Core {
             self.advance_round(tc.round).await;
         }
 
-        // Let's see if we have the block's data. If we don't, the mempool
-        // will get it and then make us resume processing this block.
-        if !self.mempool_driver.verify(block.clone()).await? {
-            debug!("Processing of {} suspended: missing payload", digest);
-            return Ok(());
-        }
-
-        // All check pass, we can process this block.
+        // The payload is embedded in the block, so we can process it immediately.
         self.process_block(block).await
     }
 
@@ -451,7 +456,7 @@ impl Core {
         }
 
         // This is the main loop: it processes incoming blocks and votes,
-        // and receive timeout notifications from our Timeout Manager.
+        // and receives timeout notifications from our Timeout Manager.
         loop {
             let result = tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {

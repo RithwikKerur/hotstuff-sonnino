@@ -50,7 +50,7 @@ impl Block {
         qc: QC,
         author: PublicKey,
         round: Round,
-        payload: Vec<Digest>,
+        payload: Vec<Vec<u8>>,
         secret: &SecretKey,
     ) -> Self {
         let block = Block {

@@ -22,7 +22,8 @@ impl Node {
         parameters: Option<String>,
     ) -> Result<Self, ConfigError> {
         let (tx_commit, rx_commit) = channel(CHANNEL_CAPACITY);
-        let (tx_consensus_to_mempool, rx_consensus_to_mempool) = channel(CHANNEL_CAPACITY);
+        // Channel through which the mempool's BatchMaker delivers serialized
+        // batches to the consensus Proposer.
         let (tx_mempool_to_consensus, rx_mempool_to_consensus) = channel(CHANNEL_CAPACITY);
 
         // Read the committee and secret key from file.
@@ -43,13 +44,11 @@ impl Node {
         // Run the signature service.
         let signature_service = SignatureService::new(secret_key);
 
-        // Make a new mempool.
+        // Make a new mempool. It will forward batches to the consensus proposer.
         Mempool::spawn(
             name,
             committee.mempool,
             parameters.mempool,
-            store.clone(),
-            rx_consensus_to_mempool,
             tx_mempool_to_consensus,
         );
 
@@ -61,7 +60,6 @@ impl Node {
             signature_service,
             store,
             rx_mempool_to_consensus,
-            tx_consensus_to_mempool,
             tx_commit,
         );
 
@@ -75,7 +73,7 @@ impl Node {
 
     pub async fn analyze_block(&mut self) {
         while let Some(_block) = self.commit.recv().await {
-            // This is where we can further process committed block.
+            // This is where we can further process committed blocks.
         }
     }
 }

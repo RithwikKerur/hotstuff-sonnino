@@ -3,7 +3,6 @@ use crate::core::Core;
 use crate::error::ConsensusError;
 use crate::helper::Helper;
 use crate::leader::LeaderElector;
-use crate::mempool::MempoolDriver;
 use crate::messages::{Block, Timeout, Vote, TC};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
@@ -12,7 +11,6 @@ use bytes::Bytes;
 use crypto::{Digest, PublicKey, SignatureService};
 use futures::SinkExt as _;
 use log::info;
-use mempool::ConsensusMempoolMessage;
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -48,8 +46,8 @@ impl Consensus {
         parameters: Parameters,
         signature_service: SignatureService,
         store: Store,
-        rx_mempool: Receiver<Digest>,
-        tx_mempool: Sender<ConsensusMempoolMessage>,
+        // Receives serialized batches from the local mempool's BatchMaker.
+        rx_mempool: Receiver<Vec<u8>>,
         tx_commit: Sender<Block>,
     ) {
         // NOTE: This log entry is used to compute performance.
@@ -81,9 +79,6 @@ impl Consensus {
         // Make the leader election module.
         let leader_elector = LeaderElector::new(committee.clone());
 
-        // Make the mempool driver.
-        let mempool_driver = MempoolDriver::new(store.clone(), tx_mempool, tx_loopback.clone());
-
         // Make the synchronizer.
         let synchronizer = Synchronizer::new(
             name,
@@ -100,7 +95,6 @@ impl Consensus {
             signature_service.clone(),
             store.clone(),
             leader_elector,
-            mempool_driver,
             synchronizer,
             parameters.timeout_delay,
             /* rx_message */ rx_consensus,

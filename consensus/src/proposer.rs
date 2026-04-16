@@ -3,11 +3,14 @@ use crate::consensus::{ConsensusMessage, Round};
 use crate::messages::{Block, QC, TC};
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, SignatureService};
+use ed25519_dalek::Digest as _;
+use ed25519_dalek::Sha512;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, info};
 use network::{CancelHandler, ReliableSender};
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::convert::TryInto;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Debug)]
@@ -20,10 +23,13 @@ pub struct Proposer {
     name: PublicKey,
     committee: Committee,
     signature_service: SignatureService,
-    rx_mempool: Receiver<Digest>,
+    /// Receives serialized batches from the local mempool.
+    rx_mempool: Receiver<Vec<u8>>,
     rx_message: Receiver<ProposerMessage>,
     tx_loopback: Sender<Block>,
-    buffer: HashSet<Digest>,
+    /// Maps batch digest → serialized batch bytes, so we can efficiently drop
+    /// batches that were already included in committed blocks.
+    buffer: HashMap<Digest, Vec<u8>>,
     network: ReliableSender,
 }
 
@@ -32,7 +38,7 @@ impl Proposer {
         name: PublicKey,
         committee: Committee,
         signature_service: SignatureService,
-        rx_mempool: Receiver<Digest>,
+        rx_mempool: Receiver<Vec<u8>>,
         rx_message: Receiver<ProposerMessage>,
         tx_loopback: Sender<Block>,
     ) {
@@ -44,12 +50,21 @@ impl Proposer {
                 rx_mempool,
                 rx_message,
                 tx_loopback,
-                buffer: HashSet::new(),
+                buffer: HashMap::new(),
                 network: ReliableSender::new(),
             }
             .run()
             .await;
         });
+    }
+
+    /// Compute the digest of a serialized batch (mirrors the hash used in block.payload).
+    fn batch_digest(batch: &[u8]) -> Digest {
+        Digest(
+            Sha512::digest(batch).as_slice()[..32]
+                .try_into()
+                .expect("SHA-512 digest is always ≥ 32 bytes"),
+        )
     }
 
     /// Helper function. It waits for a future to complete and then delivers a value.
@@ -59,13 +74,16 @@ impl Proposer {
     }
 
     async fn make_block(&mut self, round: Round, qc: QC, tc: Option<TC>) {
+        // Drain the buffer: all accumulated batches become the block's payload.
+        let payload: Vec<Vec<u8>> = self.buffer.drain().map(|(_, v)| v).collect();
+
         // Generate a new block.
         let block = Block::new(
             qc,
             tc,
             self.name,
             round,
-            /* payload */ self.buffer.drain().collect(),
+            payload,
             self.signature_service.clone(),
         )
         .await;
@@ -75,13 +93,15 @@ impl Proposer {
 
             #[cfg(feature = "benchmark")]
             for x in &block.payload {
+                // Recompute the digest so it matches what the BatchMaker logged.
+                let digest = Self::batch_digest(x);
                 // NOTE: This log entry is used to compute performance.
-                info!("Created {} -> {:?}", block, x);
+                info!("Created {} -> {:?}", block, digest);
             }
         }
         debug!("Created {:?}", block);
 
-        // Broadcast our new block.
+        // Broadcast our new block to all other nodes.
         debug!("Broadcasting {:?}", block);
         let (names, addresses): (Vec<_>, _) = self
             .committee
@@ -96,13 +116,13 @@ impl Proposer {
             .broadcast(addresses, Bytes::from(message))
             .await;
 
-        // Send our block to the core for processing.
+        // Send our block to the core for local processing.
         self.tx_loopback
             .send(block)
             .await
             .expect("Failed to send block");
 
-        // Control system: Wait for 2f+1 nodes to acknowledge our block before continuing.
+        // Control system: wait for 2f+1 nodes to acknowledge our block before continuing.
         let mut wait_for_quorum: FuturesUnordered<_> = names
             .into_iter()
             .zip(handles.into_iter())
@@ -124,10 +144,9 @@ impl Proposer {
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                Some(digest) = self.rx_mempool.recv() => {
-                    //if self.buffer.len() < 155 {
-                        self.buffer.insert(digest);
-                    //}
+                Some(batch) = self.rx_mempool.recv() => {
+                    let digest = Self::batch_digest(&batch);
+                    self.buffer.insert(digest, batch);
                 },
                 Some(message) = self.rx_message.recv() => match message {
                     ProposerMessage::Make(round, qc, tc) => self.make_block(round, qc, tc).await,

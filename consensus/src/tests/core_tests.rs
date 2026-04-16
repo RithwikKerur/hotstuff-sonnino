@@ -18,14 +18,12 @@ fn core(
     let (tx_core, rx_core) = channel(1);
     let (tx_loopback, rx_loopback) = channel(1);
     let (tx_proposer, rx_proposer) = channel(1);
-    let (tx_mempool, mut rx_mempool) = channel(1);
     let (tx_commit, rx_commit) = channel(1);
 
     let signature_service = SignatureService::new(secret);
     let _ = fs::remove_dir_all(store_path);
     let store = Store::new(store_path).unwrap();
     let leader_elector = LeaderElector::new(committee.clone());
-    let mempool_driver = MempoolDriver::new(store.clone(), tx_mempool, tx_loopback.clone());
     let synchronizer = Synchronizer::new(
         name,
         committee.clone(),
@@ -34,19 +32,12 @@ fn core(
         /* sync_retry_delay */ 100_000,
     );
 
-    tokio::spawn(async move {
-        loop {
-            rx_mempool.recv().await;
-        }
-    });
-
     Core::spawn(
         name,
         committee,
         signature_service,
         store,
         leader_elector,
-        mempool_driver,
         synchronizer,
         /* timeout_delay */ 100,
         /* rx_message */ rx_core,
