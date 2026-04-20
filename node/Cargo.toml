@@ -20,6 +20,8 @@ rand = "0.7.3"
 thiserror = "1.0.21"
 anyhow = "1.0.38"
 
+rocksdb = "0.19.0"
+
 crypto = { path = "../crypto" }
 store = { path = "../store" }
 consensus = { path = "../consensus" }
@@ -28,7 +30,11 @@ mempool = { path = "../mempool" }
 [features]
 benchmark = ["consensus/benchmark", "mempool/benchmark"]
 
-[[bin]]         
-name = "client"   
-path = "src/client.rs" 
-required-features = ["benchmark"] 
+[[bin]]
+name = "client"
+path = "src/client.rs"
+required-features = ["benchmark"]
+
+[[bin]]
+name = "block_sizes"
+path = "src/bin/block_sizes.rs"

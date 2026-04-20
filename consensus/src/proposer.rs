@@ -111,6 +111,7 @@ impl Proposer {
             .unzip();
         let message = bincode::serialize(&ConsensusMessage::Propose(block.clone()))
             .expect("Failed to serialize block");
+        info!("Sending block {} size={} B", block, message.len());
         let handles = self
             .network
             .broadcast(addresses, Bytes::from(message))
