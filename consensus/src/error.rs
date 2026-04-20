@@ -62,4 +62,10 @@ pub enum ConsensusError {
 
     #[error("Invalid payload")]
     InvalidPayload,
+
+    #[error("Merkle proof verification failed for shard")]
+    InvalidMerkleProof,
+
+    #[error("Reed-Solomon reconstruction failed")]
+    ErasureReconstructionFailed,
 }

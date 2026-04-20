@@ -1,9 +1,10 @@
 use crate::aggregator::Aggregator;
 use crate::config::Committee;
 use crate::consensus::{ConsensusMessage, Round};
+use crate::erasure;
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
-use crate::messages::{Block, Timeout, Vote, QC, TC};
+use crate::messages::{Block, ErasureProposal, Timeout, Vote, QC, TC};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::timer::Timer;
@@ -435,6 +436,109 @@ impl Core {
         self.process_block(block).await
     }
 
+    async fn handle_erasure_proposal(
+        &mut self,
+        proposal: ErasureProposal,
+    ) -> ConsensusResult<()> {
+        // ------------------------------------------------------------------
+        // 1. Early leader check (before doing any expensive work).
+        // ------------------------------------------------------------------
+        ensure!(
+            proposal.author == self.leader_elector.get_leader(proposal.round),
+            ConsensusError::WrongLeader {
+                digest: Digest::default(),
+                leader: proposal.author,
+                round: proposal.round,
+            }
+        );
+
+        // ------------------------------------------------------------------
+        // 2. Verify each shard's Merkle proof.
+        // ------------------------------------------------------------------
+        for ((shard, idx), proof) in proposal
+            .shards
+            .iter()
+            .zip(proposal.shard_indices.iter())
+            .zip(proposal.proofs.iter())
+        {
+            ensure!(
+                erasure::verify_proof(shard, *idx, proof, &proposal.merkle_root),
+                ConsensusError::InvalidMerkleProof
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 3. Reconstruct the full block from the fragment set.
+        //    Each node receives k = 2F+1 shards, which is exactly the
+        //    reconstruction threshold, so no inter-node help is needed.
+        // ------------------------------------------------------------------
+        let k = proposal.data_shards;
+        let n = proposal.total_shards;
+        let mut shards_opt: Vec<Option<Vec<u8>>> = vec![None; n];
+        for (idx, shard) in proposal
+            .shard_indices
+            .iter()
+            .zip(proposal.shards.iter())
+        {
+            shards_opt[*idx] = Some(shard.clone());
+        }
+        let block_bytes =
+            erasure::reconstruct(shards_opt, k, n, proposal.block_len)?;
+
+        // ------------------------------------------------------------------
+        // 4. Deserialise and run normal block verification.
+        // ------------------------------------------------------------------
+        let block: Block =
+            bincode::deserialize(&block_bytes).map_err(ConsensusError::SerializationError)?;
+
+        ensure!(
+            block.author == proposal.author,
+            ConsensusError::MalformedBlock(block.digest())
+        );
+        ensure!(
+            block.round == proposal.round,
+            ConsensusError::MalformedBlock(block.digest())
+        );
+
+        block.verify(&self.committee)?;
+
+        // ------------------------------------------------------------------
+        // 5. Advance round based on embedded QC / TC.
+        // ------------------------------------------------------------------
+        self.process_qc(&block.qc).await;
+        if let Some(ref tc) = block.tc {
+            self.advance_round(tc.round).await;
+        }
+
+        // ------------------------------------------------------------------
+        // 6. Store this node's fragment set keyed by block digest.
+        //    Layout: merkle_root || shard_indices || shards
+        // ------------------------------------------------------------------
+        let frag_key = {
+            let mut k = block.digest().to_vec();
+            k.extend_from_slice(b"_frags");
+            k
+        };
+        let frag_val = bincode::serialize(&(
+            proposal.merkle_root,
+            &proposal.shard_indices,
+            &proposal.shards,
+        ))
+        .expect("Failed to serialise fragment store entry");
+        self.store.write(frag_key, frag_val).await;
+
+        debug!(
+            "Verified and stored {} fragment(s) for {:?}",
+            proposal.shards.len(),
+            block
+        );
+
+        // ------------------------------------------------------------------
+        // 7. Hand off to the normal block-processing pipeline (vote, commit).
+        // ------------------------------------------------------------------
+        self.process_block(&block).await
+    }
+
     async fn handle_tc(&mut self, tc: TC) -> ConsensusResult<()> {
         tc.verify(&self.committee)?;
         if tc.round < self.round {
@@ -460,6 +564,9 @@ impl Core {
         loop {
             let result = tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {
+                    // New path: leader sends erasure-coded fragments.
+                    ConsensusMessage::ErasureProposal(p) => self.handle_erasure_proposal(p).await,
+                    // Sync path: Helper sends a full block in response to a SyncRequest.
                     ConsensusMessage::Propose(block) => self.handle_proposal(&block).await,
                     ConsensusMessage::Vote(vote) => self.handle_vote(&vote).await,
                     ConsensusMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,

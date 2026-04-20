@@ -1,6 +1,7 @@
 use crate::config::{Committee, Stake};
 use crate::consensus::{ConsensusMessage, Round};
-use crate::messages::{Block, QC, TC};
+use crate::erasure;
+use crate::messages::{Block, ErasureProposal, QC, TC};
 use bytes::Bytes;
 use crypto::{Digest, PublicKey, SignatureService};
 use ed25519_dalek::Digest as _;
@@ -23,12 +24,11 @@ pub struct Proposer {
     name: PublicKey,
     committee: Committee,
     signature_service: SignatureService,
-    /// Receives serialized batches from the local mempool.
+    /// Receives serialised batches from the local mempool.
     rx_mempool: Receiver<Vec<u8>>,
     rx_message: Receiver<ProposerMessage>,
     tx_loopback: Sender<Block>,
-    /// Maps batch digest → serialized batch bytes, so we can efficiently drop
-    /// batches that were already included in committed blocks.
+    /// Maps batch digest → batch bytes for efficient cleanup.
     buffer: HashMap<Digest, Vec<u8>>,
     network: ReliableSender,
 }
@@ -58,29 +58,29 @@ impl Proposer {
         });
     }
 
-    /// Compute the digest of a serialized batch (mirrors the hash used in block.payload).
+    /// SHA-512/256 digest of a serialised batch; matches what BatchMaker logs.
     fn batch_digest(batch: &[u8]) -> Digest {
         Digest(
             Sha512::digest(batch).as_slice()[..32]
                 .try_into()
-                .expect("SHA-512 digest is always ≥ 32 bytes"),
+                .expect("SHA-512 output is always ≥ 32 bytes"),
         )
     }
 
-    /// Helper function. It waits for a future to complete and then delivers a value.
+    /// Await a cancel-handler and yield the associated stake value.
     async fn waiter(wait_for: CancelHandler, deliver: Stake) -> Stake {
         let _ = wait_for.await;
         deliver
     }
 
     async fn make_block(&mut self, round: Round, qc: QC, tc: Option<TC>) {
-        // Drain the buffer: all accumulated batches become the block's payload.
+        // ---------------------------------------------------------------
+        // 1. Build and sign the block.
+        // ---------------------------------------------------------------
         let payload: Vec<Vec<u8>> = self.buffer.drain().map(|(_, v)| v).collect();
-
-        // Generate a new block.
         let block = Block::new(
-            qc,
-            tc,
+            qc.clone(),
+            tc.clone(),
             self.name,
             round,
             payload,
@@ -90,50 +90,94 @@ impl Proposer {
 
         if !block.payload.is_empty() {
             info!("Created {}", block);
-
             #[cfg(feature = "benchmark")]
             for x in &block.payload {
-                // Recompute the digest so it matches what the BatchMaker logged.
                 let digest = Self::batch_digest(x);
-                // NOTE: This log entry is used to compute performance.
                 info!("Created {} -> {:?}", block, digest);
             }
         }
         debug!("Created {:?}", block);
 
-        // Broadcast our new block to all other nodes.
-        debug!("Broadcasting {:?}", block);
-        let (names, addresses): (Vec<_>, _) = self
-            .committee
-            .broadcast_addresses(&self.name)
-            .iter()
-            .cloned()
-            .unzip();
-        let message = bincode::serialize(&ConsensusMessage::Propose(block.clone()))
-            .expect("Failed to serialize block");
-        let handles = self
-            .network
-            .broadcast(addresses, Bytes::from(message))
-            .await;
+        // ---------------------------------------------------------------
+        // 2. Erasure-code the serialised block.
+        //    Scheme: k = 2F+1 data shards, n = k * N total shards.
+        //    Each of the N nodes receives k consecutive shards (enough to
+        //    independently reconstruct the full block).
+        // ---------------------------------------------------------------
+        let block_bytes = bincode::serialize(&block).expect("Failed to serialise block");
+        let block_len = block_bytes.len();
 
-        // Send our block to the core for local processing.
+        let k = self.committee.quorum_threshold() as usize; // 2F+1
+        let n_nodes = self.committee.size();                 // N
+        let n = k * n_nodes;                                 // (2F+1)*N total shards
+
+        debug!(
+            "Erasure-coding block {} ({}B): k={} n={}",
+            block, block_len, k, n
+        );
+
+        let (shards, merkle_root, proofs) = erasure::encode(&block_bytes, k, n);
+
+        // ---------------------------------------------------------------
+        // 3. Send per-node ErasureProposal messages to every OTHER node.
+        // ---------------------------------------------------------------
+        let ordered = self.committee.ordered_authorities();
+        let mut handles: FuturesUnordered<_> = FuturesUnordered::new();
+
+        for (node_idx, (name, address)) in ordered.iter().enumerate() {
+            if name == &self.name {
+                continue; // Leader handles itself via the loopback.
+            }
+
+            // Shards assigned to this node: [node_idx*k, (node_idx+1)*k).
+            let shard_indices: Vec<usize> = (node_idx * k..(node_idx + 1) * k).collect();
+            let node_shards: Vec<Vec<u8>> =
+                shard_indices.iter().map(|&i| shards[i].clone()).collect();
+            let node_proofs: Vec<_> =
+                shard_indices.iter().map(|&i| proofs[i].clone()).collect();
+
+            let proposal = ErasureProposal {
+                author: self.name,
+                round,
+                qc: qc.clone(),
+                tc: tc.clone(),
+                signature: block.signature.clone(),
+                merkle_root,
+                data_shards: k,
+                total_shards: n,
+                block_len,
+                shard_indices,
+                shards: node_shards,
+                proofs: node_proofs,
+            };
+
+            let message =
+                bincode::serialize(&ConsensusMessage::ErasureProposal(proposal))
+                    .expect("Failed to serialise ErasureProposal");
+
+            let handler = self
+                .network
+                .send(*address, Bytes::from(message))
+                .await;
+
+            let stake = self.committee.stake(name);
+            handles.push(Self::waiter(handler, stake));
+        }
+
+        // ---------------------------------------------------------------
+        // 4. Feed the full block into the local core for immediate processing.
+        //    The leader already has everything it needs; no reconstruction required.
+        // ---------------------------------------------------------------
         self.tx_loopback
             .send(block)
             .await
-            .expect("Failed to send block");
+            .expect("Failed to send block to loopback");
 
-        // Control system: wait for 2f+1 nodes to acknowledge our block before continuing.
-        let mut wait_for_quorum: FuturesUnordered<_> = names
-            .into_iter()
-            .zip(handles.into_iter())
-            .map(|(name, handler)| {
-                let stake = self.committee.stake(&name);
-                Self::waiter(handler, stake)
-            })
-            .collect();
-
+        // ---------------------------------------------------------------
+        // 5. Wait until 2F+1 nodes (counting ourselves) have ACKed receipt.
+        // ---------------------------------------------------------------
         let mut total_stake = self.committee.stake(&self.name);
-        while let Some(stake) = wait_for_quorum.next().await {
+        while let Some(stake) = handles.next().await {
             total_stake += stake;
             if total_stake >= self.committee.quorum_threshold() {
                 break;

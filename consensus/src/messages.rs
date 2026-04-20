@@ -1,5 +1,6 @@
 use crate::config::Committee;
 use crate::consensus::Round;
+use crate::erasure::MerkleProof;
 use crate::error::{ConsensusError, ConsensusResult};
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
 use ed25519_dalek::Digest as _;
@@ -324,4 +325,42 @@ impl fmt::Debug for TC {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "TC({}, {:?})", self.round, self.high_qc_rounds())
     }
+}
+
+// ---------------------------------------------------------------------------
+// ErasureProposal
+// ---------------------------------------------------------------------------
+
+/// Sent by the leader to each node during block dissemination.
+///
+/// Each node receives `data_shards` (= 2F+1) consecutive RS fragments of the
+/// serialised block, together with their Merkle proofs against `merkle_root`.
+/// The node can reconstruct the full block independently from its fragment set
+/// (since k = 2F+1 = the number of fragments it receives).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ErasureProposal {
+    // Block header fields sent in the clear for early leader validation.
+    pub author: PublicKey,
+    pub round: Round,
+    pub qc: QC,
+    pub tc: Option<TC>,
+    pub signature: Signature,
+
+    // Erasure coding parameters.
+    /// Merkle root committing to all `total_shards` RS shards.
+    pub merkle_root: [u8; 32],
+    /// k = 2F+1: minimum shards needed for reconstruction (= shards per node).
+    pub data_shards: usize,
+    /// n = (2F+1)*N: total shards across all nodes.
+    pub total_shards: usize,
+    /// Original serialised-block length (used to trim zero-padding after reconstruction).
+    pub block_len: usize,
+
+    // This node's fragment set.
+    /// Global shard indices assigned to this node.
+    pub shard_indices: Vec<usize>,
+    /// Shard bytes for each index above (each shard has the same length).
+    pub shards: Vec<Vec<u8>>,
+    /// Merkle proof for each shard above.
+    pub proofs: Vec<MerkleProof>,
 }

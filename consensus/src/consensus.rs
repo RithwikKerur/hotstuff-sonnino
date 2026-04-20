@@ -3,7 +3,7 @@ use crate::core::Core;
 use crate::error::ConsensusError;
 use crate::helper::Helper;
 use crate::leader::LeaderElector;
-use crate::messages::{Block, Timeout, Vote, TC};
+use crate::messages::{Block, ErasureProposal, Timeout, Vote, TC};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
@@ -29,6 +29,9 @@ pub type Round = u64;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ConsensusMessage {
+    /// Initial block dissemination: per-node erasure-coded fragment set.
+    ErasureProposal(ErasureProposal),
+    /// Full block used by the sync helper when a node requests a missing block.
     Propose(Block),
     Vote(Vote),
     Timeout(Timeout),
@@ -135,15 +138,16 @@ impl MessageHandler for ConsensusReceiverHandler {
                 .send((missing, origin))
                 .await
                 .expect("Failed to send consensus message"),
-            message @ ConsensusMessage::Propose(..) => {
-                // Reply with an ACK.
+            // Both the initial erasure proposal and sync-path full blocks
+            // require an ACK so the sender's ReliableSender can release the
+            // cancel-handler and credit quorum stake.
+            message @ ConsensusMessage::ErasureProposal(..)
+            | message @ ConsensusMessage::Propose(..) => {
                 let _ = writer.send(Bytes::from("Ack")).await;
-
-                // Pass the message to the consensus core.
                 self.tx_consensus
                     .send(message)
                     .await
-                    .expect("Failed to consensus message")
+                    .expect("Failed to send consensus message")
             }
             message => self
                 .tx_consensus

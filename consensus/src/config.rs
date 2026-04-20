@@ -82,4 +82,24 @@ impl Committee {
             .map(|(name, x)| (*name, x.address))
             .collect()
     }
+
+    /// All authorities in a stable, deterministic order (sorted by public-key bytes).
+    /// Used to assign erasure-coded shard ranges consistently across all nodes.
+    pub fn ordered_authorities(&self) -> Vec<(PublicKey, SocketAddr)> {
+        let mut entries: Vec<(PublicKey, SocketAddr)> = self
+            .authorities
+            .iter()
+            .map(|(k, v)| (*k, v.address))
+            .collect();
+        entries.sort_by_key(|(k, _)| k.0);
+        entries
+    }
+
+    /// Stable index of `name` in the canonical ordering produced by `ordered_authorities`.
+    pub fn node_index(&self, name: &PublicKey) -> usize {
+        self.ordered_authorities()
+            .iter()
+            .position(|(k, _)| k == name)
+            .expect("Node not found in committee")
+    }
 }
