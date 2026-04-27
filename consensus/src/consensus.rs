@@ -3,7 +3,7 @@ use crate::core::Core;
 use crate::error::ConsensusError;
 use crate::helper::Helper;
 use crate::leader::LeaderElector;
-use crate::messages::{Block, ErasureProposal, Timeout, Vote, TC};
+use crate::messages::{Block, ErasureProposal, SyncFragments, Timeout, Vote, TC};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
@@ -31,8 +31,8 @@ pub type Round = u64;
 pub enum ConsensusMessage {
     /// Initial block dissemination: per-node erasure-coded fragment set.
     ErasureProposal(ErasureProposal),
-    /// Full block used by the sync helper when a node requests a missing block.
-    Propose(Block),
+    /// Sync response: the responder's stored fragment set for the requested block.
+    SyncFragments(SyncFragments),
     Vote(Vote),
     Timeout(Timeout),
     TC(TC),
@@ -57,7 +57,9 @@ impl Consensus {
         parameters.log();
 
         let (tx_consensus, rx_consensus) = channel(CHANNEL_CAPACITY);
-        let (tx_loopback, rx_loopback) = channel(CHANNEL_CAPACITY);
+        // Two loopbacks: proposer sends ErasureProposal; synchronizer sends Block (resume).
+        let (tx_proposer_loopback, rx_proposer_loopback) = channel(CHANNEL_CAPACITY);
+        let (tx_sync_loopback, rx_sync_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_proposer, rx_proposer) = channel(CHANNEL_CAPACITY);
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
 
@@ -87,7 +89,7 @@ impl Consensus {
             name,
             committee.clone(),
             store.clone(),
-            tx_loopback.clone(),
+            tx_sync_loopback,
             parameters.sync_retry_delay,
         );
 
@@ -101,7 +103,8 @@ impl Consensus {
             synchronizer,
             parameters.timeout_delay,
             /* rx_message */ rx_consensus,
-            rx_loopback,
+            rx_sync_loopback,
+            rx_proposer_loopback,
             tx_proposer,
             tx_commit,
         );
@@ -113,7 +116,7 @@ impl Consensus {
             signature_service,
             rx_mempool,
             /* rx_message */ rx_proposer,
-            tx_loopback,
+            tx_proposer_loopback,
         );
 
         // Spawn the helper module.
@@ -138,11 +141,8 @@ impl MessageHandler for ConsensusReceiverHandler {
                 .send((missing, origin))
                 .await
                 .expect("Failed to send consensus message"),
-            // Both the initial erasure proposal and sync-path full blocks
-            // require an ACK so the sender's ReliableSender can release the
-            // cancel-handler and credit quorum stake.
-            message @ ConsensusMessage::ErasureProposal(..)
-            | message @ ConsensusMessage::Propose(..) => {
+            // ErasureProposal is sent via ReliableSender and requires an ACK.
+            message @ ConsensusMessage::ErasureProposal(..) => {
                 let _ = writer.send(Bytes::from("Ack")).await;
                 self.tx_consensus
                     .send(message)

@@ -328,6 +328,54 @@ impl fmt::Debug for TC {
 }
 
 // ---------------------------------------------------------------------------
+// StoredFragments / SyncFragments
+// ---------------------------------------------------------------------------
+
+/// What every node stores at `digest` key in RocksDB: its own designated RS
+/// shard set for that block.  The synchronizer and helper call `into_block` to
+/// reconstruct the full block on demand.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StoredFragments {
+    pub data_shards: usize,
+    pub total_shards: usize,
+    pub block_len: usize,
+    pub shard_indices: Vec<usize>,
+    pub shards: Vec<Vec<u8>>,
+    pub proofs: Vec<MerkleProof>,
+    pub merkle_root: [u8; 32],
+}
+
+impl StoredFragments {
+    pub fn into_block(self) -> ConsensusResult<Block> {
+        let mut shards_opt = vec![None; self.total_shards];
+        for (idx, shard) in self.shard_indices.into_iter().zip(self.shards.into_iter()) {
+            shards_opt[idx] = Some(shard);
+        }
+        let bytes = crate::erasure::reconstruct(
+            shards_opt,
+            self.data_shards,
+            self.total_shards,
+            self.block_len,
+        )?;
+        bincode::deserialize(&bytes).map_err(ConsensusError::SerializationError)
+    }
+}
+
+/// Sent by the Helper in response to a `SyncRequest`.  The receiver reconstructs
+/// the block, re-encodes it, and stores its own designated shard set.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SyncFragments {
+    pub digest: Digest,
+    pub data_shards: usize,
+    pub total_shards: usize,
+    pub block_len: usize,
+    pub shard_indices: Vec<usize>,
+    pub shards: Vec<Vec<u8>>,
+    pub proofs: Vec<MerkleProof>,
+    pub merkle_root: [u8; 32],
+}
+
+// ---------------------------------------------------------------------------
 // ErasureProposal
 // ---------------------------------------------------------------------------
 

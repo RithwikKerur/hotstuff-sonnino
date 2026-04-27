@@ -7,7 +7,9 @@ Because the leader rotates each round, each PHASE_TIMING entry is emitted
 only by the vote-collecting leader for that round. Pass ALL node logs so
 every round is covered.
 
+python3 benchmark/plot_phase_timing.py benchmark/logs/node-*.log -o benchmark/plots/phase_timing
 python3 plot_phase_timing.py logs/node-*.log -o plots/phase_timing
+
 
 """
 

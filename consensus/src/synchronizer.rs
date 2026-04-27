@@ -1,7 +1,7 @@
 use crate::config::Committee;
 use crate::consensus::{ConsensusMessage, CHANNEL_CAPACITY};
 use crate::error::ConsensusResult;
-use crate::messages::{Block, QC};
+use crate::messages::{Block, StoredFragments, QC};
 use bytes::Bytes;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -123,7 +123,10 @@ impl Synchronizer {
         }
         let parent = block.parent();
         match self.store.read(parent.to_vec()).await? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            Some(bytes) => {
+                let frags: StoredFragments = bincode::deserialize(&bytes)?;
+                Ok(Some(frags.into_block()?))
+            }
             None => {
                 if let Err(e) = self.inner_channel.send(block.clone()).await {
                     panic!("Failed to send request to synchronizer: {}", e);

@@ -4,7 +4,7 @@ use crate::consensus::{ConsensusMessage, Round};
 use crate::erasure;
 use crate::error::{ConsensusError, ConsensusResult};
 use crate::leader::LeaderElector;
-use crate::messages::{Block, ErasureProposal, Timeout, Vote, QC, TC};
+use crate::messages::{Block, ErasureProposal, StoredFragments, SyncFragments, Timeout, Vote, QC, TC};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::timer::Timer;
@@ -36,6 +36,7 @@ pub struct Core {
     synchronizer: Synchronizer,
     rx_message: Receiver<ConsensusMessage>,
     rx_loopback: Receiver<Block>,
+    rx_proposer_loopback: Receiver<ErasureProposal>,
     tx_proposer: Sender<ProposerMessage>,
     tx_commit: Sender<Block>,
     round: Round,
@@ -45,6 +46,8 @@ pub struct Core {
     timer: Timer,
     aggregator: Aggregator,
     network: SimpleSender,
+    // Fragment sets awaiting ancestor confirmation before being written to disk.
+    pending_fragments: HashMap<Digest, StoredFragments>,
     // Phase timing: keyed by round number.
     phase1_start: HashMap<Round, Instant>, // when process_block first sees the block
     phase1_end: HashMap<Round, Instant>,   // when the node casts its vote (phase 1 done)
@@ -62,6 +65,7 @@ impl Core {
         timeout_delay: u64,
         rx_message: Receiver<ConsensusMessage>,
         rx_loopback: Receiver<Block>,
+        rx_proposer_loopback: Receiver<ErasureProposal>,
         tx_proposer: Sender<ProposerMessage>,
         tx_commit: Sender<Block>,
     ) {
@@ -75,6 +79,7 @@ impl Core {
                 synchronizer,
                 rx_message,
                 rx_loopback,
+                rx_proposer_loopback,
                 tx_proposer,
                 tx_commit,
                 round: 1,
@@ -84,6 +89,7 @@ impl Core {
                 timer: Timer::new(timeout_delay),
                 aggregator: Aggregator::new(committee),
                 network: SimpleSender::new(),
+                pending_fragments: HashMap::new(),
                 phase1_start: HashMap::new(),
                 phase1_end: HashMap::new(),
             }
@@ -92,11 +98,25 @@ impl Core {
         });
     }
 
-    async fn store_block(&mut self, block: &Block) {
-        let key = block.digest().to_vec();
-        let value = bincode::serialize(block).expect("Failed to serialize block");
+    async fn store_fragments(&mut self, block_digest: Digest, frags: StoredFragments) {
+        let key = block_digest.to_vec();
+        let value = bincode::serialize(&frags).expect("Failed to serialize fragment store entry");
         self.store.write(key, value).await;
     }
+
+    fn proposal_to_stored_fragments(proposal: &ErasureProposal) -> StoredFragments {
+        StoredFragments {
+            data_shards: proposal.data_shards,
+            total_shards: proposal.total_shards,
+            block_len: proposal.block_len,
+            shard_indices: proposal.shard_indices.clone(),
+            shards: proposal.shards.clone(),
+            proofs: proposal.proofs.clone(),
+            merkle_root: proposal.merkle_root,
+        }
+    }
+
+
 
     fn increase_last_voted_round(&mut self, target: Round) {
         self.last_voted_round = max(self.last_voted_round, target);
@@ -370,8 +390,11 @@ impl Core {
             }
         };
 
-        // Store the block only if we have already processed all its ancestors.
-        self.store_block(block).await;
+        // Ancestors confirmed — flush this block's fragment set to disk.
+        // This fires notify_read for any block suspended waiting on this digest.
+        if let Some(frags) = self.pending_fragments.remove(&block.digest()) {
+            self.store_fragments(block.digest(), frags).await;
+        }
 
         self.cleanup_proposer(&b0, &b1, block).await;
 
@@ -408,32 +431,58 @@ impl Core {
         Ok(())
     }
 
-    async fn handle_proposal(&mut self, block: &Block) -> ConsensusResult<()> {
-        let digest = block.digest();
+    async fn handle_sync_fragments(&mut self, frags: SyncFragments) -> ConsensusResult<()> {
+        // Reconstruct the full block from the responder's shard set.
+        let mut shards_opt = vec![None; frags.total_shards];
+        for (idx, shard) in frags.shard_indices.iter().zip(frags.shards.iter()) {
+            shards_opt[*idx] = Some(shard.clone());
+        }
+        let block_bytes =
+            erasure::reconstruct(shards_opt, frags.data_shards, frags.total_shards, frags.block_len)?;
 
-        // Ensure the block proposer is the right leader for the round.
+        // Verify the reconstructed block is well-formed and its digest matches.
+        let block: Block =
+            bincode::deserialize(&block_bytes).map_err(ConsensusError::SerializationError)?;
         ensure!(
-            block.author == self.leader_elector.get_leader(block.round),
-            ConsensusError::WrongLeader {
-                digest,
-                leader: block.author,
-                round: block.round
-            }
+            block.digest() == frags.digest,
+            ConsensusError::MalformedBlock(frags.digest)
         );
-
-        // Check the block is correctly formed.
         block.verify(&self.committee)?;
 
-        // Process the QC. This may allow us to advance round.
-        self.process_qc(&block.qc).await;
+        // Re-encode and store this node's designated shard set.
+        let k = frags.data_shards;
+        let n = frags.total_shards;
+        let (shards, merkle_root, proofs) = erasure::encode(&block_bytes, k, n);
+        let ordered = self.committee.ordered_authorities();
+        let node_idx = ordered
+            .iter()
+            .position(|(name, _)| name == &self.name)
+            .expect("Our public key is not in the committee");
+        let shard_indices: Vec<usize> = (node_idx * k..(node_idx + 1) * k).collect();
+        let my_shards: Vec<Vec<u8>> = shard_indices.iter().map(|&i| shards[i].clone()).collect();
+        let my_proofs: Vec<_> = shard_indices.iter().map(|&i| proofs[i].clone()).collect();
 
-        // Process the TC (if any). This may also allow us to advance round.
+        self.pending_fragments.insert(
+            frags.digest,
+            StoredFragments {
+                data_shards: k,
+                total_shards: n,
+                block_len: frags.block_len,
+                shard_indices,
+                shards: my_shards,
+                proofs: my_proofs,
+                merkle_root,
+            },
+        );
+
+        // Advance round based on embedded QC/TC, then run the normal pipeline
+        // so that process_block can flush our fragments and cascade any
+        // further sync that's needed for missing ancestors.
+        self.process_qc(&block.qc).await;
         if let Some(ref tc) = block.tc {
             self.advance_round(tc.round).await;
         }
-
-        // The payload is embedded in the block, so we can process it immediately.
-        self.process_block(block).await
+        self.process_block(&block).await
     }
 
     async fn handle_erasure_proposal(
@@ -453,7 +502,9 @@ impl Core {
         );
 
         // ------------------------------------------------------------------
-        // 2. Verify each shard's Merkle proof.
+        // 2. Verify each shard's Merkle proof before reconstruction.
+        //    Rejects corrupt or mismatched shards from a Byzantine leader
+        //    without paying the cost of RS reconstruction first.
         // ------------------------------------------------------------------
         for ((shard, idx), proof) in proposal
             .shards
@@ -482,8 +533,7 @@ impl Core {
         {
             shards_opt[*idx] = Some(shard.clone());
         }
-        let block_bytes =
-            erasure::reconstruct(shards_opt, k, n, proposal.block_len)?;
+        let block_bytes = erasure::reconstruct(shards_opt, k, n, proposal.block_len)?;
 
         // ------------------------------------------------------------------
         // 4. Deserialise and run normal block verification.
@@ -511,24 +561,16 @@ impl Core {
         }
 
         // ------------------------------------------------------------------
-        // 6. Store this node's fragment set keyed by block digest.
-        //    Layout: merkle_root || shard_indices || shards
+        // 6. Park fragment set in memory; the disk write happens inside
+        //    process_block after get_ancestors confirms ancestors are present.
+        //    This preserves the invariant: a block is on disk only once all
+        //    its ancestors are on disk (so notify_read never fires prematurely).
         // ------------------------------------------------------------------
-        let frag_key = {
-            let mut k = block.digest().to_vec();
-            k.extend_from_slice(b"_frags");
-            k
-        };
-        let frag_val = bincode::serialize(&(
-            proposal.merkle_root,
-            &proposal.shard_indices,
-            &proposal.shards,
-        ))
-        .expect("Failed to serialise fragment store entry");
-        self.store.write(frag_key, frag_val).await;
+        self.pending_fragments
+            .insert(block.digest(), Self::proposal_to_stored_fragments(&proposal));
 
         debug!(
-            "Verified and stored {} fragment(s) for {:?}",
+            "Queued {} fragment(s) for {:?}",
             proposal.shards.len(),
             block
         );
@@ -564,16 +606,17 @@ impl Core {
         loop {
             let result = tokio::select! {
                 Some(message) = self.rx_message.recv() => match message {
-                    // New path: leader sends erasure-coded fragments.
                     ConsensusMessage::ErasureProposal(p) => self.handle_erasure_proposal(p).await,
-                    // Sync path: Helper sends a full block in response to a SyncRequest.
-                    ConsensusMessage::Propose(block) => self.handle_proposal(&block).await,
+                    ConsensusMessage::SyncFragments(f) => self.handle_sync_fragments(f).await,
                     ConsensusMessage::Vote(vote) => self.handle_vote(&vote).await,
                     ConsensusMessage::Timeout(timeout) => self.handle_timeout(&timeout).await,
                     ConsensusMessage::TC(tc) => self.handle_tc(tc).await,
                     _ => panic!("Unexpected protocol message")
                 },
+                // Synchronizer resume: parent became available, re-run process_block.
                 Some(block) = self.rx_loopback.recv() => self.process_block(&block).await,
+                // Leader's own proposal comes as an ErasureProposal via this channel.
+                Some(proposal) = self.rx_proposer_loopback.recv() => self.handle_erasure_proposal(proposal).await,
                 () = &mut self.timer => self.local_timeout_round().await,
             };
             match result {

@@ -1,5 +1,6 @@
 use crate::config::Committee;
 use crate::consensus::ConsensusMessage;
+use crate::messages::{StoredFragments, SyncFragments};
 use bytes::Bytes;
 use crypto::{Digest, PublicKey};
 use log::warn;
@@ -57,10 +58,20 @@ impl Helper {
                 .await
                 .expect("Failed to read from storage")
             {
-                let block =
-                    bincode::deserialize(&bytes).expect("Failed to deserialize our own block");
-                let message = bincode::serialize(&ConsensusMessage::Propose(block))
-                    .expect("Failed to serialize block");
+                let frags: StoredFragments =
+                    bincode::deserialize(&bytes).expect("Failed to deserialize stored fragments");
+                let response = SyncFragments {
+                    digest: digest.clone(),
+                    data_shards: frags.data_shards,
+                    total_shards: frags.total_shards,
+                    block_len: frags.block_len,
+                    shard_indices: frags.shard_indices,
+                    shards: frags.shards,
+                    proofs: frags.proofs,
+                    merkle_root: frags.merkle_root,
+                };
+                let message = bincode::serialize(&ConsensusMessage::SyncFragments(response))
+                    .expect("Failed to serialize sync fragments");
                 self.network.send(address, Bytes::from(message)).await;
             }
         }

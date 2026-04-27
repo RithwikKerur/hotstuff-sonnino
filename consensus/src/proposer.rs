@@ -27,7 +27,7 @@ pub struct Proposer {
     /// Receives serialised batches from the local mempool.
     rx_mempool: Receiver<Vec<u8>>,
     rx_message: Receiver<ProposerMessage>,
-    tx_loopback: Sender<Block>,
+    tx_loopback: Sender<ErasureProposal>,
     /// Maps batch digest → batch bytes for efficient cleanup.
     buffer: HashMap<Digest, Vec<u8>>,
     network: ReliableSender,
@@ -40,7 +40,7 @@ impl Proposer {
         signature_service: SignatureService,
         rx_mempool: Receiver<Vec<u8>>,
         rx_message: Receiver<ProposerMessage>,
-        tx_loopback: Sender<Block>,
+        tx_loopback: Sender<ErasureProposal>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -77,7 +77,9 @@ impl Proposer {
         // ---------------------------------------------------------------
         // 1. Build and sign the block.
         // ---------------------------------------------------------------
-        let payload: Vec<Vec<u8>> = self.buffer.drain().map(|(_, v)| v).collect();
+        const MAX_BATCHES: usize = 10;
+        let keys: Vec<_> = self.buffer.keys().take(MAX_BATCHES).cloned().collect();
+        let payload: Vec<Vec<u8>> = keys.iter().filter_map(|k| self.buffer.remove(k)).collect();
         let block = Block::new(
             qc.clone(),
             tc.clone(),
@@ -111,10 +113,8 @@ impl Proposer {
         let n_nodes = self.committee.size();                 // N
         let n = k * n_nodes;                                 // (2F+1)*N total shards
 
-        debug!(
-            "Erasure-coding block {} ({}B): k={} n={}",
-            block, block_len, k, n
-        );
+        info!("Block {} size={} B", block, block_len);
+        debug!("Erasure-coding block {} ({}B): k={} n={}", block, block_len, k, n);
 
         let (shards, merkle_root, proofs) = erasure::encode(&block_bytes, k, n);
 
@@ -165,13 +165,36 @@ impl Proposer {
         }
 
         // ---------------------------------------------------------------
-        // 4. Feed the full block into the local core for immediate processing.
-        //    The leader already has everything it needs; no reconstruction required.
+        // 4. Build and loopback the leader's own ErasureProposal so the core
+        //    stores the leader's designated fragment set (same path as non-leaders).
         // ---------------------------------------------------------------
+        let leader_idx = ordered
+            .iter()
+            .position(|(name, _)| name == &self.name)
+            .expect("Leader not found in committee");
+        let leader_shard_indices: Vec<usize> = (leader_idx * k..(leader_idx + 1) * k).collect();
+        let leader_shards: Vec<Vec<u8>> =
+            leader_shard_indices.iter().map(|&i| shards[i].clone()).collect();
+        let leader_proofs: Vec<_> =
+            leader_shard_indices.iter().map(|&i| proofs[i].clone()).collect();
+        let leader_proposal = ErasureProposal {
+            author: self.name,
+            round,
+            qc,
+            tc,
+            signature: block.signature.clone(),
+            merkle_root,
+            data_shards: k,
+            total_shards: n,
+            block_len,
+            shard_indices: leader_shard_indices,
+            shards: leader_shards,
+            proofs: leader_proofs,
+        };
         self.tx_loopback
-            .send(block)
+            .send(leader_proposal)
             .await
-            .expect("Failed to send block to loopback");
+            .expect("Failed to send leader proposal to loopback");
 
         // ---------------------------------------------------------------
         // 5. Wait until 2F+1 nodes (counting ourselves) have ACKed receipt.
